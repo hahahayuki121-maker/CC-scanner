@@ -216,19 +216,23 @@ header{display:flex;align-items:center;justify-content:space-between;padding:12p
 <div class="config-bar">
   <div class="cfg-row">
     <span class="cfg-label">Finnhub</span>
-    <input class="cfg-input" type="password" id="api-key" placeholder="API Key...">
+    <input class="cfg-input" type="password" id="api-key" placeholder="API Key（自動儲存）...">
+    <span class="cfg-label" style="min-width:70px">Alpha Vantage</span>
+    <input class="cfg-input" type="password" id="av-key" placeholder="AV Key（K線用，自動儲存）...">
     <button class="btn btn-primary" onclick="initDashboard()">載入</button>
     <button class="btn btn-ghost" onclick="loadDemo()">Demo</button>
   </div>
   <div class="cfg-row">
     <span class="cfg-label">TG Token</span>
-    <input class="cfg-input" type="text" id="tg-token" placeholder="bot token...">
+    <input class="cfg-input" type="password" id="tg-token" placeholder="••••••••（自動儲存）">
     <span class="cfg-label" style="min-width:40px">Chat ID</span>
-    <input class="cfg-input" type="text" id="tg-chatid" placeholder="ID..." style="max-width:120px">
-    <button class="btn btn-warn" onclick="testTG()">測試</button>
+    <input class="cfg-input" type="text" id="tg-chatid" placeholder="Chat ID（自動儲存）" style="max-width:130px">
+    <button class="btn btn-warn" onclick="testTG()">測試TG</button>
+    <button class="btn btn-ghost" onclick="clearSavedKeys()">清除儲存</button>
   </div>
   <div class="cfg-row">
     <span id="api-status" style="font-size:10px;color:var(--text3)"></span>
+    <span id="av-status" style="font-size:10px;color:var(--text3);margin-left:10px"></span>
   </div>
 </div>
 
@@ -369,19 +373,53 @@ header{display:flex;align-items:center;justify-content:space-between;padding:12p
 </div>
 
 <script>
-// ── CONSTANTS ──────────────────────────────────────────────────────────────
-const TG_TOKEN_DEFAULT = ''; // 請輸入你的 Telegram Bot Token
-const TG_CHAT_DEFAULT  = ''; // 請輸入你的 Chat ID
+// ── CONSTANTS & LOCALSTORAGE ───────────────────────────────────────────────
+// Masked token stored in localStorage — never hardcoded
+const TG_TOKEN_MASKED = '87150•••••:AAFzez••••••••••••••••••••••4SkY';
 
-let apiKey = '', tgToken = TG_TOKEN_DEFAULT, tgChat = TG_CHAT_DEFAULT;
+let apiKey = '', avKey = '', tgToken = '', tgChat = '';
 let geoMode = false, demoMode = false;
 let alertRules = [], alertInterval = null, lastFired = {};
 let currentWL = 'default', lastStocks = [];
 
-try { alertRules = JSON.parse(localStorage.getItem('cc_alerts')||'[]'); } catch(e){}
+// Load saved keys from localStorage
+function loadSavedKeys() {
+  const fh = localStorage.getItem('cc_fh_key');
+  const av = localStorage.getItem('cc_av_key');
+  const tg = localStorage.getItem('cc_tg_token');
+  const ci = localStorage.getItem('cc_tg_chat');
+  if (fh) { document.getElementById('api-key').value = fh; apiKey = fh; }
+  if (av) { document.getElementById('av-key').value = av; avKey = av; }
+  if (tg) { document.getElementById('tg-token').value = tg; tgToken = tg; }
+  if (ci) { document.getElementById('tg-chatid').value = ci; tgChat = ci; }
 
-// Pre-fill TG fields
-// TG fields left blank for security
+  // Show masked display if tg saved
+  if (tg) {
+    const masked = tg.slice(0,6) + '••••••' + tg.slice(-4);
+    document.getElementById('tg-token').placeholder = '已儲存：' + masked;
+  }
+  if (fh) document.getElementById('api-status').textContent = '✓ Key 已從上次記錄載入';
+}
+
+function saveKeys() {
+  if (apiKey)  localStorage.setItem('cc_fh_key',    apiKey);
+  if (avKey)   localStorage.setItem('cc_av_key',     avKey);
+  if (tgToken) localStorage.setItem('cc_tg_token',  tgToken);
+  if (tgChat)  localStorage.setItem('cc_tg_chat',   tgChat);
+}
+
+function clearSavedKeys() {
+  if (!confirm('確定清除所有儲存的 Key？')) return;
+  ['cc_fh_key','cc_av_key','cc_tg_token','cc_tg_chat'].forEach(k => localStorage.removeItem(k));
+  ['api-key','av-key','tg-token','tg-chatid'].forEach(id => {
+    document.getElementById(id).value = '';
+    document.getElementById(id).placeholder = '已清除';
+  });
+  apiKey = avKey = tgToken = tgChat = '';
+  showToast('已清除所有儲存的 Key', 'var(--accent4)');
+}
+
+try { alertRules = JSON.parse(localStorage.getItem('cc_alerts')||'[]'); } catch(e){}
 
 
 const WATCHLISTS = {
@@ -517,15 +555,111 @@ function analyzeEntry(q){
   return{ch,rsi,vol,score,conds,cc,signal};
 }
 
+// Alpha Vantage: fetch daily adjusted closes (free tier)
+async function fetchAVDaily(symbol) {
+  if (!avKey) return null;
+  try {
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${symbol}&outputsize=compact&apikey=${avKey}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const ts = d['Time Series (Daily)'];
+    if (!ts) return null;
+    // Return last 60 days of closes
+    return Object.values(ts).slice(0,60).map(v => parseFloat(v['4. close'])).reverse();
+  } catch(e) { return null; }
+}
+
+// Real RSI from AV k-line data
+function calcRSI14real(closes) {
+  if (!closes || closes.length < 15) return null;
+  let gains = 0, losses = 0;
+  const slice = closes.slice(-15);
+  for (let i = 1; i < slice.length; i++) {
+    const d = slice[i] - slice[i-1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  const rs = (gains/14) / (losses/14 || 0.001);
+  return Math.round(100 - 100/(1+rs));
+}
+
+function calcEMAreal(closes, period) {
+  if (!closes || closes.length < period) return null;
+  const k = 2/(period+1);
+  let ema = closes[closes.length - period];
+  for (let i = closes.length - period + 1; i < closes.length; i++) {
+    ema = closes[i]*k + ema*(1-k);
+  }
+  return ema;
+}
+
+function calcMACDreal(closes) {
+  if (!closes || closes.length < 26) return null;
+  const ema12 = calcEMAreal(closes, 12);
+  const ema26 = calcEMAreal(closes, 26);
+  if (!ema12 || !ema26) return null;
+  return ema12 - ema26;
+}
+
+// AV call tracker (25/day limit)
+let avCallsToday = parseInt(localStorage.getItem('cc_av_calls_today')||'0');
+let avCallsDate  = localStorage.getItem('cc_av_calls_date') || '';
+function trackAVCall() {
+  const today = new Date().toDateString();
+  if (avCallsDate !== today) { avCallsToday = 0; avCallsDate = today; }
+  avCallsToday++;
+  localStorage.setItem('cc_av_calls_today', avCallsToday);
+  localStorage.setItem('cc_av_calls_date', avCallsDate);
+  const remaining = 25 - avCallsToday;
+  document.getElementById('av-status').textContent = `AV: ${remaining} 次剩餘今日`;
+  document.getElementById('av-status').style.color = remaining < 5 ? 'var(--accent2)' : 'var(--text3)';
+}
+
 async function analyzeWL(symbols){
-  const qs=await Promise.allSettled(symbols.map(s=>fetchQ(s)));
-  const r=[];
+  const qs = await Promise.allSettled(symbols.map(s=>fetchQ(s)));
+  const r = [];
+
+  // Fetch AV k-lines for first 8 symbols if AV key available (save quota)
+  const avSymbols = avKey ? symbols.slice(0, 8) : [];
+  const avData = {};
+  for (const sym of avSymbols) {
+    if (avCallsToday >= 24) break; // conserve quota
+    const closes = await fetchAVDaily(sym);
+    if (closes) { avData[sym] = closes; trackAVCall(); }
+    await new Promise(r => setTimeout(r, 300)); // rate limit
+  }
+
   qs.forEach((res,i)=>{
     try{
       if(res.status!=='fulfilled') return;
       const q=res.value;
       if(!q||!q.c||q.c===0||q.error) return;
-      r.push({symbol:symbols[i],price:q.c,open:q.o,high:q.h,low:q.l,...analyzeEntry(q)});
+      const base = analyzeEntry(q);
+      const closes = avData[symbols[i]];
+
+      // Override with real indicators if AV data available
+      if (closes) {
+        const realRSI  = calcRSI14real(closes);
+        const realMACD = calcMACDreal(closes);
+        const ema20    = calcEMAreal(closes, 20);
+        const ema60    = calcEMAreal(closes, Math.min(60, closes.length));
+        if (realRSI)  base.rsi  = realRSI;
+        if (realMACD) base.macd = realMACD;
+        base.ema20 = ema20;
+        base.ema60 = ema60;
+        base.hasRealData = true;
+        // Re-score with real data
+        base.conds[3] = realRSI ? (realRSI > 50 && realRSI < 75) : base.conds[3];
+        base.conds[0] = ema60 ? q.c > ema60 : base.conds[0]; // C1: price > 60MA
+        base.cc = base.conds.filter(Boolean).length;
+        // Re-signal
+        if (base.cc >= 4 && base.ch > 0)       base.signal = {label:'強進場★', cls:'sig-strong'};
+        else if (base.cc >= 3 && base.ch >= 0)  base.signal = {label:'Sell Put ✓', cls:'sig-sell-put'};
+        else if (base.rsi > 65 && base.ch < 0)  base.signal = {label:'Sell Call ✓', cls:'sig-sell-call'};
+        else if (base.cc >= 2)                   base.signal = {label:'波段觀察', cls:'sig-buy'};
+        else                                      base.signal = {label:'觀察', cls:'sig-watch'};
+      }
+
+      r.push({symbol:symbols[i], price:q.c, open:q.o, high:q.h, low:q.l, ...base});
     }catch(e){}
   });
   return r.sort((a,b)=>b.score-a.score);
@@ -552,7 +686,7 @@ function renderTable(id,stocks,cntId){
       <td><span class="sbadge ${s.signal.cls}">${s.signal.label}</span></td>
       <td>${dots(s.conds)}</td>
     </tr>`).join('')}</tbody>
-  </table><div class="note">* RSI估算 · 點代號開啟TV圖表 · 5燈:趨勢/通道/轉折/動能/量能</div>`;
+  </table><div class="note">* RSI估算值 · ★=含真實K線(AV) · 點代號開TV圖表 · 5燈:趨勢/通道/轉折/動能/量能</div>`;
 }
 
 function renderOptions(stocks){
@@ -746,10 +880,12 @@ function startAlertMonitor(){
 
 // ── INIT ───────────────────────────────────────────────────────────────────
 async function initDashboard(){
-  apiKey=document.getElementById('api-key').value.trim();
-  tgToken=document.getElementById('tg-token').value.trim()||TG_TOKEN_DEFAULT;
-  tgChat=document.getElementById('tg-chatid').value.trim()||TG_CHAT_DEFAULT;
+  apiKey  = document.getElementById('api-key').value.trim()  || apiKey;
+  avKey   = document.getElementById('av-key').value.trim()   || avKey;
+  tgToken = document.getElementById('tg-token').value.trim() || tgToken;
+  tgChat  = document.getElementById('tg-chatid').value.trim()|| tgChat;
   if(!apiKey){alert('請輸入 Finnhub API Key');return;}
+  saveKeys();
   const st=document.getElementById('api-status');
   st.textContent='測試連線...';st.style.color='var(--text2)';
   try{
@@ -1096,6 +1232,7 @@ function showSection(name) {
 }
 
 // Boot
+loadSavedKeys();
 renderEvents(); renderAlerts();
 </script>
 </body>
