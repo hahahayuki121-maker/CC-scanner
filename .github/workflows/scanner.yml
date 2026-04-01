@@ -2,13 +2,14 @@ name: CC Market Scanner
 
 on:
   schedule:
+    # 每 5 分鐘執行一次
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -19,14 +20,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas pandas_ta requests pytz lxml
 
       - name: Run scanner
         env:
