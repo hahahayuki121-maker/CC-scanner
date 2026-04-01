@@ -4,7 +4,7 @@ CC Market Scanner - 最終版 v4 (修正純文字版)
 """
 
 import yfinance as yf
-import ta  # 改用穩定版 ta 庫，確保 GitHub Actions 不會報錯
+import ta  
 import requests
 import pandas as pd
 import os
