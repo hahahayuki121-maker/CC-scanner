@@ -6,7 +6,7 @@ CC Market Scanner — 最終版
 """
 
 import yfinance as yf
-import pandas_ta as ta
+import ta
 import requests
 import pandas as pd
 import os
@@ -54,23 +54,22 @@ def is_market_open(symbol):
         tw = datetime.now(pytz.timezone("Asia/Taipei"))
         if tw.weekday() >= 5: return False
         m = tw.hour * 60 + tw.minute
-        return 540 <= m < 810           # 台股 09:00–13:30
+        return 540 <= m < 810
     ny = datetime.now(pytz.timezone("America/New_York"))
     if ny.weekday() >= 5: return False
     m = ny.hour * 60 + ny.minute
-    return 570 <= m < 930               # 美股 09:30–15:30
+    return 570 <= m < 930
 
 def is_swing_scan_time(symbol):
-    """策略C 只在收盤前30分鐘執行"""
     if ".TW" in symbol:
         tw = datetime.now(pytz.timezone("Asia/Taipei"))
         if tw.weekday() >= 5: return False
         m = tw.hour * 60 + tw.minute
-        return 780 <= m < 810           # 台股 13:00–13:30
+        return 780 <= m < 810
     ny = datetime.now(pytz.timezone("America/New_York"))
     if ny.weekday() >= 5: return False
     m = ny.hour * 60 + ny.minute
-    return 900 <= m < 930               # 美股 15:00–15:30
+    return 900 <= m < 930
 
 # ── 數據獲取 ───────────────────────────────────────────────────────────────────
 def _clean(df):
@@ -87,13 +86,22 @@ def get_15m(sym):
 def get_1d(sym):
     return _clean(yf.download(sym, interval="1d",  period="100d", progress=False, auto_adjust=True))
 
+# ── 指標計算（使用 ta 套件）──────────────────────────────────────────────────
+def add_rsi(df, col="Close", length=14):
+    df = df.copy()
+    df["RSI"] = ta.momentum.RSIIndicator(df[col], window=length).rsi()
+    return df
+
+def add_sma(df, col, length, out_col):
+    df = df.copy()
+    df[out_col] = ta.trend.SMAIndicator(df[col], window=length).sma_indicator()
+    return df
+
 # ── 策略A：WASHOUT 殺低反彈 ──────────────────────────────────────────────────
 def strategy_washout(symbol, df_5m):
-    """5/6 燈觸發，C1+C2 必須成立"""
     if len(df_5m) < 4: return
 
-    df = df_5m.copy()
-    df["RSI"] = ta.rsi(df["Close"], length=14)
+    df = add_rsi(df_5m)
 
     curr  = df.iloc[-1]
     prev  = df.iloc[-2]
@@ -124,14 +132,12 @@ def strategy_washout(symbol, df_5m):
             f"⏰ {tw_time()} TWN"
         )
 
-# ── 策略B：ORB 開盤區間突破 ──────────────────────────────────────────────────
+# ── 策略B：ORB 開盤區間突破 ───────────────────────────────────────────────────
 def strategy_orb(symbol, df_5m, df_15m):
-    """4/4 全中，5m + 15m 雙重確認，量能 ≥ 2倍"""
     if len(df_5m) < 6 or len(df_15m) < 3: return
 
-    df5  = df_5m.copy()
-    df5["V_MA10"] = ta.sma(df5["Volume"], length=10)
-    df5["RSI"]    = ta.rsi(df5["Close"],  length=14)
+    df5  = add_rsi(df_5m)
+    df5  = add_sma(df5, "Volume", 10, "V_MA10")
 
     curr5  = df5.iloc[-1]
     prev5  = df5.iloc[-2]
@@ -142,8 +148,9 @@ def strategy_orb(symbol, df_5m, df_15m):
     vr   = curr5["Volume"] / (curr5["V_MA10"] + 1)
     rsi  = curr5["RSI"]
 
-    # 多頭
-    if all([curr5["Close"] > hi15, prev5["Close"] <= hi15, vr >= 2.0, curr15["Close"] > hi15]):
+    # 多頭突破
+    if all([curr5["Close"] > hi15, prev5["Close"] <= hi15,
+            vr >= 2.0, curr15["Close"] > hi15]):
         send_tg(
             f"🚀 *[ORB 多頭突破]*: `{symbol}`\n"
             f"💰 現價: `{curr5['Close']:.2f}` · 突破: `{hi15:.2f}`\n"
@@ -154,8 +161,9 @@ def strategy_orb(symbol, df_5m, df_15m):
         )
         return
 
-    # 空頭（Sell Call 參考）
-    if all([curr5["Close"] < lo15, prev5["Close"] >= lo15, vr >= 2.0, curr15["Close"] < lo15]):
+    # 空頭跌破
+    if all([curr5["Close"] < lo15, prev5["Close"] >= lo15,
+            vr >= 2.0, curr15["Close"] < lo15]):
         send_tg(
             f"🔻 *[ORB 空頭跌破]* Sell Call 參考: `{symbol}`\n"
             f"💰 現價: `{curr5['Close']:.2f}` · 跌破: `{lo15:.2f}`\n"
@@ -164,23 +172,20 @@ def strategy_orb(symbol, df_5m, df_15m):
             f"⏰ {tw_time()} TWN"
         )
 
-# ── 策略C：PULLBACK 波段縮量回測 ─────────────────────────────────────────────
+# ── 策略C：PULLBACK 波段縮量回測 ──────────────────────────────────────────────
 def strategy_pullback(symbol, df_1d, df_5m):
-    """5/5 全中，日線縮量 + RSI勾頭 + 5m短線確認"""
     if len(df_1d) < 65 or len(df_5m) < 3: return
 
-    d = df_1d.copy()
-    d["MA60"]   = ta.sma(d["Close"],  length=60)
-    d["RSI"]    = ta.rsi(d["Close"],  length=14)
-    d["V_Avg5"] = ta.sma(d["Volume"], length=5)
+    d = add_rsi(df_1d)
+    d = add_sma(d, "Close",  60, "MA60")
+    d = add_sma(d, "Volume",  5, "V_Avg5")
 
-    f = df_5m.copy()
-    f["RSI"] = ta.rsi(f["Close"], length=14)
+    f = add_rsi(df_5m)
 
-    d_c  = d.iloc[-1]
-    d_p  = d.iloc[-2]
-    f_c  = f.iloc[-1]
-    f_p  = f.iloc[-2]
+    d_c = d.iloc[-1]
+    d_p = d.iloc[-2]
+    f_c = f.iloc[-1]
+    f_p = f.iloc[-2]
 
     if pd.isna(d_c["MA60"]) or pd.isna(d_c["RSI"]): return
 
