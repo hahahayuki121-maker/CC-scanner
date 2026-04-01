@@ -23,7 +23,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir yfinance pandas requests pytz lxml
-          # 改用這種方式強制安裝 pandas-ta
           pip install --no-cache-dir pandas-ta==0.3.14b0
 
       - name: Run scanner
