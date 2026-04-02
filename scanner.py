@@ -3,13 +3,6 @@ CC Market Scanner - v5.8 日內/波段辨識版
 標籤：🇹🇼(台股) | 🇺🇸(龍頭) | 🚀(妖股) | ₿(加密)
 策略：日內(當沖轉折) | 波段(趨勢起漲)
 """
-import subprocess
-import sys
-try:
-    import pandas_ta as ta
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas_ta", "yfinance", "pandas", "requests", "pytz", "lxml"])
-    import pandas_ta as ta
 import yfinance as yf
 import pandas_ta as ta
 import requests
