@@ -62,44 +62,65 @@ def sma(df, col, n): return ta.trend.SMAIndicator(df[col], window=n).sma_indicat
 # ══════════════════════════════════════════════════════════════════════════════
 # ⚡ 策略邏輯：含期權導航
 # ══════════════════════════════════════════════════════════════════════════════
-
 def scan_logic(sym, tag, df5, df1d):
-    # 1. 日內 WASHOUT (做多/Buy Call)
+    # 1. 取得數據與基礎指標
     df = df5.copy()
+    if len(df) < 20: return None
     df["RSI"] = rsi(df); df["MA5"] = sma(df, "Close", 5); df["MA20"] = sma(df, "Close", 20); df["VMA"] = sma(df, "Volume", 10)
+    
     curr = df.iloc[-1]; prev = df.iloc[-2]
     day_open = df.iloc[0]["Open"]; day_low = df["Low"].min()
     drop = (day_open - day_low) / day_open * 100
     vr = curr["Volume"] / (curr["VMA"] + 1e-6)
     
-    c1 = drop > 1.3; c2 = curr["Close"] >= day_open; c3 = curr["MA5"] > curr["MA20"]; c4 = vr > 1.1
+    # 2. WASHOUT 判斷條件 (微放寬版)
+    c1 = drop > 1.0                # 殺低超過 1%
+    c2 = curr["Close"] >= day_open * 0.995 # 站回開盤
+    c3 = curr["MA5"] > curr["MA20"] # 5/20MA 交叉 (轉折)
+    c4 = vr > 0.8                  # 量能門檻 (適應縮量行情)
     score = sum([c1, c2, c3, c4])
-    
+
+    # ── 3. 量能診斷白話文 (取代原本的量比數字) ──
+    if vr < 0.3:
+        vol_status = "❌ 極低量 (死水，千萬別市價追)"
+    elif vr < 0.8:
+        vol_status = "⚠️ 縮量 (買氣不足，謹慎)"
+    elif vr < 1.5:
+        vol_status = "✅ 溫和放量 (有人在買)"
+    else:
+        vol_status = "🔥 爆量攻擊 (動能極強！)"
+
+    # ── 4. 輸出 WASHOUT 訊息 ──
     if score >= 3 and c1 and c2:
         g = grade(score, 4)
-        opt = "🎫 操作：現股進場 或 **Buy Call** (快攻)" if vr > 1.8 else "🎫 操作：現股進場 或 **Sell Put** (收租)"
+        # 如果沒量，不建議 Buy Call (避免時間價值損耗)
+        opt_advice = "🎫 操作：**Sell Put** (收租) 或 **掛限價單**" if vr < 1.0 else "🎫 操作：現股進場 或 **Buy Call** (快攻)"
+        
         return (f"{tag} ⚡ *[WASHOUT]* `{sym}` {g}\n"
-                f"💰 現價: `{curr['Close']:.2f}` · 殺低: `{drop:.1f}%` · 量比: `{vr:.1f}x`\n"
-                f"{opt}\n⏰ {tw_time()}")
+                f"💰 現價: `{curr['Close']:.2f}` · 跌幅: `{drop:.1f}%`回升\n"
+                f"📊 動能: {vol_status}\n"
+                f"{opt_advice}\n"
+                f"💡 提醒：量能低時「價差大」，請勿用市價單！\n"
+                f"⏰ {tw_time()}")
 
-    # 2. 超買警戒 (避險/Covered Call)
-    bias = (curr["Close"] - df["MA20"].iloc[-1]) / df["MA20"].iloc[-1] * 100
-    c_ob = curr["RSI"] > 78; c_break = curr["Close"] < df["MA5"].iloc[-1]
-    if c_ob and c_break:
+    # 5. 超買警戒 (Covered Call)
+    bias = (curr["Close"] - df["MA20"].iloc[-1]) / (df["MA20"].iloc[-1] + 1e-6) * 100
+    if curr["RSI"] > 78 and curr["Close"] < df["MA5"].iloc[-1]:
         return (f"{tag} ⚠️ *[超買警戒]* `{sym}`\n"
                 f"💰 現價: `{curr['Close']:.2f}` · RSI: `{curr['RSI']:.0f}`\n"
-                f"🎫 操作：**Sell Call (Covered)** 避險收租\n⏰ {tw_time()}")
+                f"🎫 操作：**Sell Call (Covered)** 針對大倉位收租避險\n⏰ {tw_time()}")
 
-    # 3. 波段 PULLBACK (定投加碼/Sell Put)
+    # 6. 波段 PULLBACK (定投加碼)
     if not df1d.empty:
         d = df1d.copy()
         d["RSI"] = rsi(d); d["MA60"] = sma(d, "Close", 60)
         dc = d.iloc[-1]; dp = d.iloc[-2]
-        if dc["Close"] > d["MA60"].iloc[-1] and dp["RSI"] < 50 and dc["RSI"] > dp["RSI"]:
+        if dc["Close"] > d["MA60"].iloc[-1] and dp["RSI"] < 52 and dc["RSI"] > dp["RSI"]:
             return (f"{tag} 📈 *[波段回測]* `{sym}`\n"
                     f"💰 現價: `{dc['Close']:.2f}` · 季線支撐中\n"
-                    f"🎫 操作：**Sell Put** 獲取打折買股權\n⏰ {tw_time()}")
+                    f"🎫 操作：適合 **Sell Put** 獲取打折買股權\n⏰ {tw_time()}")
     return None
+
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 def main():
