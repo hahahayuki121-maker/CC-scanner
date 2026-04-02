@@ -1,7 +1,5 @@
 name: CC Market Scanner
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 jobs:
   scan:
