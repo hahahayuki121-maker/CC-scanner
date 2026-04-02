@@ -1,120 +1,77 @@
 """
-CC Market Scanner - 最終版 v4 (修正純文字版)
-標籤：🇺🇸日內 / 🇺🇸波段 / 🇹🇼日內 / 🇹🇼波段 / ₿加密
+CC Market Scanner - v5.8 日內/波段辨識版
+標籤：🇹🇼(台股) | 🇺🇸(龍頭) | 🚀(妖股) | ₿(加密)
+策略：日內(當沖轉折) | 波段(趨勢起漲)
 """
-
 import yfinance as yf
-import ta  
+import pandas_ta as ta
 import requests
 import pandas as pd
 import os
 from datetime import datetime
 import pytz
 
-# -- Token ---------------------------------------------------------------------
 TG_TOKEN   = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-# -- 監控名單 ------------------------------------------------------------------
-US_TICKERS = ["NVDA","TSLA","AMD","AAPL","META","PLTR","SOFI","COIN","F","BAC","T","SNAP","PATH","DOCU","XLE","GLD","TLT","AXTI"]
+TICKERS = {
+    "🇺🇸": ["NVDA", "TSLA", "AMD", "AMZN", "AAPL", "META", "MSFT", "GOOGL", "VRT", "ANET", "VST", "AVGO", "PLTR"],
+    "🚀": ["COIN", "MSTR", "MARA", "CLSK", "SOFI", "HOOD", "CRDO", "CRCL", "AAOI", "ASX", "PL", "BKSY", "ONDS", "RCAT", "APLD", "AEHR", "AXTI", "IONQ", "RGTI", "EH", "WOLF", "PATH"],
+    "🇹🇼": ["2330.TW", "00631L.TW"],
+    "₿ ": ["BTC-USD", "ETH-BTC"]
+}
 
-# -- 功能函數 ------------------------------------------------------------------
 def send_tg(msg):
-    if not TG_TOKEN or not TG_CHAT_ID: return False
+    if not TG_TOKEN or not TG_CHAT_ID: return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10
-        )
-        return r.json().get("ok", False)
-    except: return False
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                     data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
 
-def tw_time():
-    return datetime.now(pytz.timezone("Asia/Taipei")).strftime("%H:%M:%S")
+def tw_time(): return datetime.now(pytz.timezone("Asia/Taipei")).strftime("%H:%M:%S")
 
-def L(v): return "✅" if v else "❌"
-
-def us_mins():
-    ny = datetime.now(pytz.timezone("America/New_York"))
-    return -1 if ny.weekday() >= 5 else ny.hour * 60 + ny.minute
-
-def is_us_open():   return 570 <= us_mins() < 930
-def is_us_swing():  return 900 <= us_mins() < 930
-
-def _clean(df):
-    if df is None or df.empty: return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna()
-
-# -- 策略邏輯 ------------------------------------------------------------------
-def strategy_washout(sym, df_5m, label):
-    if len(df_5m) < 15: return
-    df = df_5m.copy()
-    # 修正：使用 ta 庫計算 RSI
-    df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
-    curr = df.iloc[-1]; prev = df.iloc[-2]; prev2 = df.iloc[-3]
+def analyze_logic(tag, sym, df_5m, df_1d):
+    # 5分K 數據 (日內)
+    df_5m["MA5"] = ta.sma(df_5m["Close"], length=5)
+    df_5m["MA20"] = ta.sma(df_5m["Close"], length=20)
+    curr_5m = df_5m.iloc[-1]
+    day_open = df_5m.iloc[0]["Open"]
     
-    day_open = df.iloc[0]["Open"]
-    day_low  = df["Low"].min()
+    # 日線數據 (波段)
+    df_1d["D_MA20"] = ta.sma(df_1d["Close"], length=20)
+    curr_1d = df_1d.iloc[-1]
+    
+    # --- 判斷型態 ---
+    # 波段定義：現價站在日線 20MA 之上，且日線趨勢向上
+    is_swing = curr_5m["Close"] > curr_1d["D_MA20"]
+    mode_tag = "📈 [波段持有]" if is_swing else "⚡ [日內短打]"
+    
+    # --- 策略 A：WASHOUT (多) ---
+    day_low = df_5m["Low"].min()
     drop = (day_open - day_low) / day_open * 100
-
-    c1 = drop > 1.5
-    c2 = curr["Close"] >= day_open
-    c3 = prev["Close"] < day_open
-    c4 = curr["RSI"] > prev["RSI"] > prev2["RSI"]
-    c5 = curr["RSI"] < 70
-    c6 = True 
     
-    score = sum([c1,c2,c3,c4,c5,c6])
-    if score >= 5 and c1 and c2:
-        send_tg(f"⚡ *[WASHOUT 殺低反轉]* `{sym}` · {label}\n💰 現價: `{curr['Close']:.2f}`\n燈號: {L(c1)}殺低 {L(c2)}站回 {L(c3)}剛翻 {L(c4)}RSI勾 {L(c5)}安全\n⏰ {tw_time()}")
+    if drop > 1.2 and curr_5m["Close"] >= day_open and curr_5m["MA5"] > curr_5m["MA20"]:
+        msg = f"{tag} {mode_tag} *{sym}*\n💰 現價: `{curr_5m['Close']:.2f}`\n💡 說明: 殺低後站回，"
+        msg += "趨勢偏多建議續抱" if is_swing else "上方有壓建議見好就收"
+        msg += f"\n⏰ {tw_time()}"
+        send_tg(msg)
 
-def strategy_orb(sym, df_5m, df_15m, label):
-    if len(df_5m) < 15: return
-    df5 = df_5m.copy()
-    df5["V_MA10"] = df5["Volume"].rolling(window=10).mean()
-    hi15 = df5.iloc[0:3]["High"].max()
-    curr = df5.iloc[-1]; prev = df5.iloc[-2]
-    vr = curr["Volume"] / (curr["V_MA10"] + 1)
-    
-    if curr["Close"] > hi15 and prev["Close"] <= hi15 and vr >= 2.0:
-        send_tg(f"🚀 *[ORB 多頭突破]* `{sym}` · {label}\n💰 現價: `{curr['Close']:.2f}` · 量比: `{vr:.1f}x`\n⏰ {tw_time()}")
+    # --- 策略 B：OVERBOUGHT (空) ---
+    bias = (curr_5m["Close"] - curr_5m["MA20"]) / curr_5m["MA20"] * 100
+    if ta.rsi(df_5m["Close"]).iloc[-1] > 75 and bias > 3.5 and curr_5m["Close"] < curr_5m["MA5"]:
+        send_tg(f"{tag} ⚠️ [轉折警戒] *{sym}*\n💰 現價: `{curr_5m['Close']:.2f}`\n💡 乖離過大且破5MA，建議先入袋為安\n⏰ {tw_time()}")
 
-def strategy_pullback(sym, df_1d, df_5m, label):
-    if len(df_1d) < 65: return
-    d = df_1d.copy()
-    d["MA60"] = d["Close"].rolling(window=60).mean()
-    d["RSI"] = ta.momentum.RSIIndicator(d["Close"], window=14).rsi()
-    d_c = d.iloc[-1]; d_p = d.iloc[-2]
-    bias = (d_c["Close"] - d_c["MA60"]) / d_c["MA60"] * 100
-    
-    if d_c["Close"] > d_c["MA60"] and 42 <= d_p["RSI"] <= 55 and d_c["RSI"] > d_p["RSI"] and 0 <= bias < 4:
-        send_tg(f"📈 *[PULLBACK 縮量]* `{sym}` · {label} ★\n💰 現價: `{d_c['Close']:.2f}` · 距季線: `{bias:.1f}%`\n⏰ {tw_time()}")
-
-# -- 主程式 --------------------------------------------------------------------
 def main():
-    print(f"CC Scanner 啟動 - {tw_time()}")
-    
-    if is_us_open():
-        for sym in US_TICKERS:
+    for tag, sym_list in TICKERS.items():
+        for sym in sym_list:
             try:
-                df5 = _clean(yf.download(sym, interval="5m", period="2d", progress=False))
-                strategy_washout(sym, df5, "US")
-                df15 = _clean(yf.download(sym, interval="15m", period="5d", progress=False))
-                strategy_orb(sym, df5, df15, "US")
-            except: continue
-            
-    if is_us_swing():
-        for sym in US_TICKERS:
-            try:
-                df1d = _clean(yf.download(sym, period="100d", progress=False))
-                df5 = _clean(yf.download(sym, interval="5m", period="2d", progress=False))
-                strategy_pullback(sym, df1d, df5, "US")
-            except: continue
-
-    print("掃描結束")
+                d5 = yf.download(sym, interval="5m", period="2d", progress=False)
+                d1 = yf.download(sym, interval="1d", period="1mo", progress=False)
+                # 清洗 MultiIndex
+                for df in [d5, d1]:
+                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                if not d5.empty and not d1.empty: analyze_logic(tag, sym, d5.dropna(), d1.dropna())
+            except: pass
 
 if __name__ == "__main__":
     main()
