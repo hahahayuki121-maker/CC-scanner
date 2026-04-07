@@ -1,9 +1,20 @@
 """
-CC Market Scanner v7.1
+CC Market Scanner v7.2
 數據源：Alpaca API（美股即時）/ yfinance（台股、加密、日線）
 標籤：🇺🇸權值 | 🛡️資安 | ⚛️核能 | 🚀妖股 | 🇨🇳中概 | 🇹🇼台股 | ₿加密
 策略：⛈️暴跌預兆 | 🔮暴漲預兆 | 🔥強勢突破 | ⚡WASHOUT | 📈波段PULLBACK
 等級：S級/A級（B級已移除）
+
+=============================================================
+v7.2 修正清單（vs v7.1）
+=============================================================
+[P0] FIX-1: 量比加入必要條件門檻 vr > 0.3，無量直接濾掉
+[P0] FIX-2: day_open 改用「當日第一根」，避免盤前抓到昨日數據
+[P1] FIX-3: 止損改為 day_low * 0.995，不再用昨低（風報比修正）
+[P1] FIX-4: RSI連升加斜率門檻 +3，避免微幅抖動觸發
+[P2] FIX-5: grade() 加入必要條件白名單，缺一不發
+[P2] FIX-6: 備注 IEX feed 量能失真問題，vr顯示加 ⚠️ 警示
+=============================================================
 """
 
 import requests
@@ -27,7 +38,6 @@ TICKERS = {
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
     "🚀": ["COIN","MSTR","MARA","CLSK","HOOD","SOFI","APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS"],
-    # 移除：PATH（陷阱股）、PL（流動性差）
     "🇨🇳": ["BABA","PDD","FUTU"],
     "🇹🇼": ["2330.TW","00631L.TW"],
     "₿":   [("BTC-USD","BTC/USDT"),("ETH-BTC","ETH/BTC")],
@@ -109,14 +119,23 @@ def grade(score, total):
     pct = score / total
     if pct >= 0.85: return "🏆 S級"
     if pct >= 0.70: return "🥇 A級"
-    return None  # B級不發送
+    return None
+
+# ── FIX-6: 量比警示標籤（IEX feed 量能天生偏低）──────────────────────────────
+def vr_label(vr):
+    """
+    IEX feed 只覆蓋市場 2~3% 成交量，量比天生偏低。
+    建議升級 Alpaca SIP feed 或改用 polygon.io 取得真實量能。
+    在此加入警示，避免誤判。
+    """
+    if vr < 0.1:
+        return f"`{vr:.1f}x` ⚠️極低(IEX失真)"
+    if vr < 0.5:
+        return f"`{vr:.1f}x` ⚠️偏低"
+    return f"`{vr:.1f}x`"
 
 # ── Alpaca 即時數據（美股）────────────────────────────────────────────────────
 def get_alpaca_bars(symbol, timeframe="5Min", limit=80):
-    """
-    Alpaca免費帳戶可取得即時美股數據
-    timeframe: 1Min / 5Min / 15Min / 1Hour / 1Day
-    """
     if not ALPACA_KEY or not ALPACA_SECRET:
         return pd.DataFrame()
     try:
@@ -125,7 +144,7 @@ def get_alpaca_bars(symbol, timeframe="5Min", limit=80):
             "timeframe": timeframe,
             "limit": limit,
             "adjustment": "raw",
-            "feed": "iex",       # IEX feed：免費即時
+            "feed": "iex",
         }
         headers = {
             "APCA-API-KEY-ID":     ALPACA_KEY,
@@ -158,6 +177,19 @@ def get_yf_15m(s): return _clean(yf.download(s, interval="15m", period="5d",   p
 def get_yf_1d(s):  return _clean(yf.download(s, interval="1d",  period="100d", progress=False, auto_adjust=True))
 def get_yf_1h(s):  return _clean(yf.download(s, interval="1h",  period="60d",  progress=False, auto_adjust=True))
 
+# ── FIX-2: 取當日開盤價（過濾日期，避免盤前抓到昨日第一根）─────────────────
+def get_day_open(df):
+    """
+    v7.1 Bug: df.iloc[0]["Open"] 在盤前會抓到昨日甚至更早的 bar
+    v7.2 Fix: 只取 index.date == 今日 的第一根
+    若當日無數據（真盤前極早期），fallback 到最新 Close
+    """
+    today = df.index[-1].date()
+    today_bars = df[df.index.date == today]
+    if not today_bars.empty:
+        return today_bars.iloc[0]["Open"]
+    return df.iloc[-1]["Close"]  # fallback
+
 # ── 指標 ──────────────────────────────────────────────────────────────────────
 def add_rsi(df, n=14):
     df = df.copy()
@@ -178,7 +210,7 @@ def add_macd(df):
     return df
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ⛈️ 暴跌預兆：高位爆量滯漲 / 支撐潰散
+# ⛈️ 暴跌預兆
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_crash_warning(sym, tag, df5):
     if len(df5) < 20: return None
@@ -188,31 +220,29 @@ def signal_crash_warning(sym, tag, df5):
 
     vr          = curr["Volume"] / (curr["VMA"] + 1)
     recent_hi   = df["High"].tail(20).max()
-    support_5   = df["Low"].tail(5).min()
-    is_high_pos = curr["Close"] > recent_hi * 0.94   # 處於近期高位
+    is_high_pos = curr["Close"] > recent_hi * 0.94
 
-    # Bug修正：support 用前5根低點，不包含當根
-    c1 = is_high_pos and vr > 3.5 and curr["Close"] < curr["Open"]  # 高位爆量收黑
-    c2 = curr["Close"] < df["Low"].tail(6).iloc[:-1].min()           # 跌破5日支撐 ★修正
+    c1 = is_high_pos and vr > 3.5 and curr["Close"] < curr["Open"]
+    c2 = curr["Close"] < df["Low"].tail(6).iloc[:-1].min()
 
+    # FIX-5: 暴跌預兆不需要量比門檻（爆量本身是條件c1的一部分）
     score = sum([c1, c2])
-    if score == 0: return None
     g = grade(score, 2)
     if not g: return None
 
     return {
-        "score": score + 10,  # 風險警告優先級最高
+        "score": score + 10,
         "msg": (
             f"{tag} ⛈️ *[暴跌預兆]* `{sym}` {g}\n"
             f"💰 現價: `{curr['Close']:.2f}`\n"
             f"燈號: {L(c1)}高位爆量收黑 {L(c2)}跌破5日支撐\n"
-            f"📊 量比: `{vr:.1f}x` · RSI: `{curr['RSI']:.0f}`\n"
+            f"📊 量比: {vr_label(vr)} · RSI: `{curr['RSI']:.0f}`\n"
             f"🚨 建議立刻減倉，切勿留過夜\n⏰ {tw_time()} TWN"
         )
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🔮 暴漲預兆：縮量蓄勢突破前高（Bug修正版）
+# 🔮 暴漲預兆
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_breakout_pre(sym, tag, df5, df15):
     if len(df5) < 20 or len(df15) < 5: return None
@@ -220,16 +250,19 @@ def signal_breakout_pre(sym, tag, df5, df15):
     curr = df.iloc[-1]; prev = df.iloc[-2]
     if pd.isna(curr["VMA"]): return None
 
-    vr = curr["Volume"] / (curr["VMA"] + 1)
-    # Bug修正：用前5根高點最大值（排除當根）
+    vr      = curr["Volume"] / (curr["VMA"] + 1)
     prev_hi = df["High"].tail(7).iloc[:-1].max()
     c15     = df15.iloc[-1]
 
-    c1 = vr > 2.5                               # 量能放大
-    c2 = curr["Close"] > prev_hi                # 突破前高 ★修正
-    c3 = prev["Close"] <= prev_hi               # 剛突破（非已久）
-    c4 = curr["RSI"] > 55 and curr["RSI"] < 78  # 動能強但非超買
-    c5 = c15["Close"] > prev_hi                 # 15m確認
+    c1 = vr > 2.5
+    c2 = curr["Close"] > prev_hi
+    c3 = prev["Close"] <= prev_hi
+    c4 = curr["RSI"] > 55 and curr["RSI"] < 78
+    c5 = c15["Close"] > prev_hi
+
+    # FIX-5: 突破必須有量，c1(量2.5x) 為必要條件
+    if not c1:
+        return None
 
     score = sum([c1,c2,c3,c4,c5])
     g = grade(score, 5)
@@ -241,13 +274,13 @@ def signal_breakout_pre(sym, tag, df5, df15):
             f"{tag} 🔮 *[暴漲預兆]* `{sym}` {g}\n"
             f"💰 現價: `{curr['Close']:.2f}` · 突破: `{prev_hi:.2f}`\n"
             f"燈號: {L(c1)}量2.5x {L(c2)}突破前高 {L(c3)}剛發動 {L(c4)}RSI動能 {L(c5)}15m確認\n"
-            f"📊 量比: `{vr:.1f}x` · RSI: `{curr['RSI']:.0f}` · 條件: `{score}/5`\n"
+            f"📊 量比: {vr_label(vr)} · RSI: `{curr['RSI']:.0f}` · 條件: `{score}/5`\n"
             f"💡 現股建倉或 Buy Call\n⏰ {tw_time()} TWN"
         )
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ⚡ WASHOUT：殺低反彈（門檻提高到1.5%，避免雜訊）
+# ⚡ WASHOUT：殺低反彈
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_washout(sym, tag, df5, df15, status):
     if len(df5) < 6 or len(df15) < 3: return None
@@ -256,35 +289,61 @@ def signal_washout(sym, tag, df5, df15, status):
     curr = df.iloc[-1]; prev = df.iloc[-2]; prev2 = df.iloc[-3]
     if pd.isna(curr["MA5"]) or pd.isna(curr["MA20"]): return None
 
-    c15      = df15.iloc[-1]
-    day_open = df.iloc[0]["Open"]
+    # FIX-2: 取當日開盤（修正盤前日期錯誤）
+    day_open = get_day_open(df)
     day_low  = df["Low"].min()
+
     yest     = df[df.index.date < df.index[-1].date()]
     yest_low = yest["Low"].min() if not yest.empty else day_low * 0.97
-    drop     = (day_open - day_low) / day_open * 100
-    rebound  = (curr["Close"] - day_low) / (day_open - day_low + 0.001)
-    vr       = curr["Volume"] / (curr["VMA10"] + 1)
 
-    # 妖股門檻更高，避免假訊號
+    drop    = (day_open - day_low) / day_open * 100
+    rebound = (curr["Close"] - day_low) / (day_open - day_low + 0.001)
+    vr      = curr["Volume"] / (curr["VMA10"] + 1)
+
     min_drop = 1.5 if "🚀" not in tag else 2.0
 
-    c1 = drop > min_drop                                  # 殺低夠深
-    c2 = curr["Close"] >= day_open * 0.998                # 站回開盤
-    c3 = prev["Close"] < day_open                         # 剛站回
-    c4 = curr["RSI"] > prev["RSI"] > prev2["RSI"]         # RSI連升
-    c5 = curr["RSI"] < 72                                 # 非追高
-    c6 = curr["Close"] > yest_low                         # 守昨低
-    c7 = rebound > 0.5                                    # 反彈力道
-    c8 = curr["MA5"] > curr["MA20"]                       # MA翻多
+    c1 = drop > min_drop
+    c2 = curr["Close"] >= day_open * 0.998
+    c3 = prev["Close"] < day_open
+
+    # FIX-4: RSI連升加斜率門檻（避免 28→29→30 觸發）
+    c4 = (curr["RSI"] > prev["RSI"] > prev2["RSI"]) and (curr["RSI"] - prev2["RSI"] > 3)
+
+    c5 = curr["RSI"] < 72
+    c6 = curr["Close"] > yest_low
+    c7 = rebound > 0.5
+    c8 = curr["MA5"] > curr["MA20"]
+
+    # FIX-1: 量比 > 0.3 作為必要條件，無量直接濾掉
+    c_vol = vr > 0.3
+    if not c_vol:
+        print(f"  {sym}: 量比 {vr:.2f}x 過低，跳過 (FIX-1)")
+        return None
+
+    # FIX-5: c1(殺低) + c2(站回) + c_vol(量能) 為必要條件
+    if not (c1 and c2):
+        return None
 
     score = sum([c1,c2,c3,c4,c5,c6,c7,c8])
     g = grade(score, 8)
-    if not g or not c1 or not c2: return None
+    if not g: return None
+
+    # FIX-3: 止損改用殺低點，不用昨低
+    # 原本: stop = yest_low（可能距現價 3~5%，風報比差）
+    # 修正: stop = day_low * 0.995（貼近洗盤低點，風報比合理）
+    stop   = day_low * 0.995
+    target = curr["Close"] * 1.02
+
+    # 風報比檢查（目標/止損距離應 >= 1.5）
+    risk   = curr["Close"] - stop
+    reward = target - curr["Close"]
+    rr     = reward / (risk + 0.001)
+    if rr < 1.5:
+        print(f"  {sym}: 風報比 {rr:.1f} 不足，跳過")
+        return None
 
     prefix = "🌅 [盤前洗盤]" if status == "PRE" else "⚡ [WASHOUT]"
     warn   = f"\n⚠️ RSI `{curr['RSI']:.0f}` 偏高，等回測5MA再加碼" if curr["RSI"] > 65 else ""
-    target = curr["Close"] * 1.02
-    stop   = yest_low
 
     return {
         "score": score,
@@ -293,14 +352,14 @@ def signal_washout(sym, tag, df5, df15, status):
             f"💰 現價: `{curr['Close']:.2f}` · 殺低: `{drop:.1f}%` · 反彈: `{rebound*100:.0f}%`\n"
             f"燈號: {L(c1)}殺低 {L(c2)}站回 {L(c3)}剛翻 {L(c4)}RSI勾 "
             f"{L(c5)}非追高 {L(c6)}守昨低 {L(c7)}彈力 {L(c8)}MA翻多\n"
-            f"📊 RSI: `{curr['RSI']:.0f}` · 量比: `{vr:.1f}x` · 條件: `{score}/8`{warn}\n"
-            f"🎯 目標: `{target:.2f}` (+2%) · 止損: `{stop:.2f}`\n"
+            f"📊 RSI: `{curr['RSI']:.0f}` · 量比: {vr_label(vr)} · 條件: `{score}/8`{warn}\n"
+            f"🎯 目標: `{target:.2f}` (+2%) · 止損: `{stop:.2f}` · 風報比: `{rr:.1f}x`\n"
             f"👉 TradingView 5m 確認\n⏰ {tw_time()} TWN"
         )
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 📈 波段PULLBACK：縮量回測季線（最高勝率）
+# 📈 波段PULLBACK
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_pullback(sym, tag, df1d, df5):
     if len(df1d) < 65 or len(df5) < 3: return None
@@ -338,7 +397,7 @@ def signal_pullback(sym, tag, df1d, df5):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ₿ 加密（yfinance 1h，Binance數據延遲小）
+# ₿ 加密（yfinance 1h）
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_crypto(yf_sym, disp, df1h):
     if len(df1h) < 60: return None
@@ -356,7 +415,6 @@ def signal_crypto(yf_sym, disp, df1h):
 
     results = []
 
-    # MACD翻零軸（最強信號，直接S級）
     if curr["MACD"] > 0 and prev["MACD"] <= 0 and price > ema50:
         results.append({"score": 10, "msg": (
             f"₿ 🔥 *[加密 MACD翻零軸]* `{disp}` 🏆 S級\n"
@@ -365,7 +423,6 @@ def signal_crypto(yf_sym, disp, df1h):
             f"💡 中線做多強信號\n⏰ {tw_time()} TWN"
         )})
 
-    # PULLBACK
     cp1=price>ema50; cp2=42<=prev["RSI"]<=58 and r>prev["RSI"]
     cp3=curr["MACD"]>0; cp4=vr<0.85; cp5=curr["MACD_hist"]>prev["MACD_hist"]
     sc = sum([cp1,cp2,cp3,cp4,cp5])
@@ -383,15 +440,17 @@ def signal_crypto(yf_sym, disp, df1h):
     return results if results else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 主程式：收集 → 分區排序 → 發送
+# 主程式
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     status = us_market_status()
     tw_now = datetime.now(pytz.timezone("Asia/Taipei"))
     print(f"\n{'='*50}")
-    print(f"CC Scanner v7.1 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"CC Scanner v7.2 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
     print(f"美股:{status} | 台股:{'開盤' if is_tw_open() else '休市'} | 加密:24/7")
     print(f"數據源：Alpaca({'✓' if ALPACA_KEY else '✗'}) / yfinance")
+    print(f"⚠️  注意：Alpaca IEX feed 量能覆蓋率僅 2~3%，量比偏低屬正常")
+    print(f"    升級 SIP feed 或改用 polygon.io 可取得真實市場量能")
     print(f"{'='*50}")
 
     intraday_sigs = []
@@ -404,7 +463,6 @@ def main():
         for tag in us_tags:
             for sym in TICKERS.get(tag, []):
                 try:
-                    # 優先用 Alpaca，fallback 到 yfinance
                     df5  = get_alpaca_5m(sym)
                     df15 = get_alpaca_15m(sym)
                     if df5.empty:
@@ -423,20 +481,21 @@ def main():
                 except Exception as e:
                     print(f"  {sym}: {e}")
 
-    # ── 美股波段（收盤前30分，用yfinance日線）────────────────────────────────
+    # ── 美股波段 ──────────────────────────────────────────────────────────────
     if is_us_swing():
         for tag in ["🇺🇸","🛡️","🚀"]:
             for sym in TICKERS.get(tag, []):
                 try:
                     df1d = get_yf_1d(sym)
-                    df5  = get_alpaca_5m(sym) or get_yf_5m(sym)
+                    df5  = get_alpaca_5m(sym)
+                    if df5.empty: df5 = get_yf_5m(sym)
                     if not df1d.empty and not df5.empty:
                         r = signal_pullback(sym, tag, df1d, df5)
                         if r: swing_sigs.append(r)
                 except Exception as e:
                     print(f"  {sym}: {e}")
 
-    # ── 台股（yfinance，有15分延遲，波段為主）────────────────────────────────
+    # ── 台股 ──────────────────────────────────────────────────────────────────
     if is_tw_open():
         for sym in TICKERS["🇹🇼"]:
             try:
@@ -459,7 +518,7 @@ def main():
             except Exception as e:
                 print(f"  {sym}: {e}")
 
-    # ── 加密（24/7）─────────────────────────────────────────────────────────
+    # ── 加密 ──────────────────────────────────────────────────────────────────
     for yf_sym, disp in TICKERS["₿"]:
         try:
             df1h = get_yf_1h(yf_sym)
@@ -469,7 +528,7 @@ def main():
         except Exception as e:
             print(f"  {disp}: {e}")
 
-    # ── 排序（分數高優先）+ 分區發送 ────────────────────────────────────────
+    # ── 排序 + 發送 ───────────────────────────────────────────────────────────
     intraday_sigs.sort(key=lambda x: x["score"], reverse=True)
     swing_sigs.sort(key=lambda x:    x["score"], reverse=True)
     crypto_sigs.sort(key=lambda x:   x["score"], reverse=True)
