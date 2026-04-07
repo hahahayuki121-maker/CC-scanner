@@ -1,138 +1,494 @@
 """
-CC Market Scanner v7.0 終極醫規版
-新增：⛈️ [暴跌預兆]：偵測高位放量滯漲、支撐潰散，防範跳空悶殺
-整合：🔮 [暴漲預兆]、🔥 [強勢突破]、⚡ [WASHOUT]
-優化：針對妖股與權值股自動切換防禦門檻
+CC Market Scanner v7.1
+數據源：Alpaca API（美股即時）/ yfinance（台股、加密、日線）
+標籤：🇺🇸權值 | 🛡️資安 | ⚛️核能 | 🚀妖股 | 🇨🇳中概 | 🇹🇼台股 | ₿加密
+策略：⛈️暴跌預兆 | 🔮暴漲預兆 | 🔥強勢突破 | ⚡WASHOUT | 📈波段PULLBACK
+等級：S級/A級（B級已移除）
 """
 
-import yfinance as yf
-import ta
 import requests
 import pandas as pd
+import ta
+import yfinance as yf
 import os
-from datetime import datetime
+from datetime import datetime, date
 import pytz
 
-# ── 配置區 ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ.get("TG_TOKEN",   "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+# ── Token ─────────────────────────────────────────────────────────────────────
+TG_TOKEN      = os.environ.get("TG_TOKEN",      "")
+TG_CHAT_ID    = os.environ.get("TG_CHAT_ID",    "")
+ALPACA_KEY    = os.environ.get("ALPACA_KEY",    "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
+ALPACA_BASE   = "https://data.alpaca.markets/v2"
 
+# ── 監控名單 ──────────────────────────────────────────────────────────────────
 TICKERS = {
-    "🇺🇸 權值": ["NVDA", "AVGO", "ANET", "VRT", "VST", "TSLA", "AMD", "AMZN", "AAPL", "META", "MSFT", "GOOGL"],
-    "🛡️ 資安": ["PANW", "FTNT", "CRWD"],
-    "⚛️ 核能": ["SMR", "OKLO", "NNE"],
-    "🚀 妖股": ["COIN", "MSTR", "MARA", "CLSK", "HOOD", "SOFI", "APLD", "IONQ", "RGTI", "NVTS", "PLTR", "ONDS", "PATH", "AAOI", "PL", "RCAT", "AXTI", "TQQQ" "LUNR"],
-    "🇨🇳 中概": ["BABA", "PDD", "FUTU"],
-    "🇹🇼 台股": ["2330.TW", "00631L.TW"],
-    "₿ 加密": ["BTC-USD", "ETH-BTC"],
+    "🇺🇸": ["NVDA","AVGO","ANET","VRT","VST","TSLA","AMD","AMZN","AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB"],
+    "🛡️": ["PANW","FTNT","CRWD"],
+    "⚛️": ["SMR","OKLO","NNE"],
+    "🚀": ["CRCL","COIN","MSTR","MARA","CLSK","HOOD","SOFI","APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS","RCAT","TQQQ","NVDL","AMDL"],
+    "🇨🇳": ["BABA","PDD","FUTU"],
+    "🇹🇼": ["2330.TW","00631L.TW"],
+    "₿":   [("BTC-USD","BTC/USDT"),("ETH-BTC","ETH/BTC")],
 }
 
-# ── 工具函式 ──────────────────────────────────────────────────────────────────
-def send_tg(msg):
-    if not TG_TOKEN or not TG_CHAT_ID: return print(msg)
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                     data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-    except: pass
+# ── 假日清單 ──────────────────────────────────────────────────────────────────
+US_HOLIDAYS = {
+    "2025-01-01","2025-01-20","2025-02-17","2025-04-18",
+    "2025-05-26","2025-06-19","2025-07-04","2025-09-01",
+    "2025-11-27","2025-12-25",
+    "2026-01-01","2026-01-19","2026-02-16","2026-04-03",
+    "2026-04-04","2026-05-25","2026-06-19","2026-07-03",
+    "2026-09-07","2026-11-26","2026-12-25",
+}
+TW_HOLIDAYS = {
+    "2026-01-01","2026-01-27","2026-01-28","2026-01-29","2026-01-30",
+    "2026-02-28","2026-04-04","2026-04-05","2026-05-01",
+    "2026-06-19","2026-09-26","2026-10-09","2026-10-10",
+}
 
-def tw_time(): return datetime.now(pytz.timezone("Asia/Taipei")).strftime("%H:%M:%S")
+# ── 時間判斷 ──────────────────────────────────────────────────────────────────
+def _now_ny():
+    return datetime.now(pytz.timezone("America/New_York"))
+
+def _now_tw():
+    return datetime.now(pytz.timezone("Asia/Taipei"))
+
+def us_market_status():
+    ny = _now_ny()
+    d  = ny.strftime("%Y-%m-%d")
+    if ny.weekday() >= 5 or d in US_HOLIDAYS:
+        return "CLOSED"
+    m = ny.hour * 60 + ny.minute
+    if 240 <= m < 570:  return "PRE"
+    if 570 <= m < 930:  return "OPEN"
+    if 930 <= m < 1200: return "POST"
+    return "CLOSED"
+
+def is_tw_open():
+    tw = _now_tw()
+    d  = tw.strftime("%Y-%m-%d")
+    if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
+    m = tw.hour * 60 + tw.minute
+    return 540 <= m < 810
+
+def is_tw_swing():
+    tw = _now_tw()
+    d  = tw.strftime("%Y-%m-%d")
+    if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
+    m = tw.hour * 60 + tw.minute
+    return 780 <= m < 810
+
+def is_us_swing():
+    ny = _now_ny()
+    d  = ny.strftime("%Y-%m-%d")
+    if ny.weekday() >= 5 or d in US_HOLIDAYS: return False
+    m = ny.hour * 60 + ny.minute
+    return 900 <= m < 930
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send_tg(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print(msg); return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        return r.json().get("ok", False)
+    except: return False
+
+def tw_time():
+    return _now_tw().strftime("%H:%M:%S")
+
+def L(v): return "✅" if v else "❌"
 
 def grade(score, total):
     pct = score / total
     if pct >= 0.85: return "🏆 S級"
     if pct >= 0.70: return "🥇 A級"
-    return "🥈 B級"
+    return None  # B級不發送
 
-def get_market_status():
-    ny = datetime.now(pytz.timezone("America/New_York"))
-    m = ny.hour * 60 + ny.minute
-    if ny.weekday() >= 5: return "CLOSED"
-    if 240 <= m < 570: return "PRE"
-    if 570 <= m < 960: return "REGULAR"
-    return "CLOSED"
-
-def get_data(s, interval, period):
+# ── Alpaca 即時數據（美股）────────────────────────────────────────────────────
+def get_alpaca_bars(symbol, timeframe="5Min", limit=80):
+    """
+    Alpaca免費帳戶可取得即時美股數據
+    timeframe: 1Min / 5Min / 15Min / 1Hour / 1Day
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return pd.DataFrame()
     try:
-        df = yf.download(s, interval=interval, period=period, progress=False, auto_adjust=True, prepost=True)
-        if df.empty: return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        last_ts = df.index[-1].astimezone(pytz.timezone("America/New_York"))
-        now_ny = datetime.now(pytz.timezone("America/New_York"))
-        if (now_ny - last_ts).total_seconds() > 900: return pd.DataFrame()
-        return df.dropna()
-    except: return pd.DataFrame()
+        url = f"{ALPACA_BASE}/stocks/{symbol}/bars"
+        params = {
+            "timeframe": timeframe,
+            "limit": limit,
+            "adjustment": "raw",
+            "feed": "iex",       # IEX feed：免費即時
+        }
+        headers = {
+            "APCA-API-KEY-ID":     ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code != 200: return pd.DataFrame()
+        bars = r.json().get("bars", [])
+        if not bars: return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"])
+        df = df.set_index("t")
+        df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+        return df[["Open","High","Low","Close","Volume"]].dropna()
+    except Exception as e:
+        print(f"  Alpaca error {symbol}: {e}")
+        return pd.DataFrame()
 
-def rsi(df): return ta.momentum.RSIIndicator(df["Close"]).rsi()
-def sma(df, col, n): return ta.trend.SMAIndicator(df[col], window=n).sma_indicator()
+def get_alpaca_5m(sym):  return get_alpaca_bars(sym, "5Min",  80)
+def get_alpaca_15m(sym): return get_alpaca_bars(sym, "15Min", 40)
+
+# ── yfinance（台股、加密、日線）──────────────────────────────────────────────
+def _clean(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna()
+
+def get_yf_5m(s):  return _clean(yf.download(s, interval="5m",  period="2d",   progress=False, auto_adjust=True))
+def get_yf_15m(s): return _clean(yf.download(s, interval="15m", period="5d",   progress=False, auto_adjust=True))
+def get_yf_1d(s):  return _clean(yf.download(s, interval="1d",  period="100d", progress=False, auto_adjust=True))
+def get_yf_1h(s):  return _clean(yf.download(s, interval="1h",  period="60d",  progress=False, auto_adjust=True))
+
+# ── 指標 ──────────────────────────────────────────────────────────────────────
+def add_rsi(df, n=14):
+    df = df.copy()
+    df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=n).rsi()
+    return df
+
+def add_sma(df, col, n, out):
+    df = df.copy()
+    df[out] = ta.trend.SMAIndicator(df[col], window=n).sma_indicator()
+    return df
+
+def add_macd(df):
+    df = df.copy()
+    m = ta.trend.MACD(df["Close"])
+    df["MACD"]      = m.macd()
+    df["MACD_sig"]  = m.macd_signal()
+    df["MACD_hist"] = m.macd_diff()
+    return df
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ⚡ 診斷邏輯 (全功能版)
+# ⛈️ 暴跌預兆：高位爆量滯漲 / 支撐潰散
 # ══════════════════════════════════════════════════════════════════════════════
-
-def scan_logic(sym, tag, df5):
-    df = df5.copy()
-    if len(df) < 25: return None
-    status = get_market_status()
-    
-    # 1. 基礎指標計算
-    df["RSI"] = rsi(df); df["MA5"] = sma(df, "Close", 5); df["MA20"] = sma(df, "Close", 20); df["VMA"] = sma(df, "Volume", 15)
+def signal_crash_warning(sym, tag, df5):
+    if len(df5) < 20: return None
+    df = add_rsi(add_sma(df5, "Volume", 15, "VMA"))
     curr = df.iloc[-1]; prev = df.iloc[-2]
-    day_open = df.iloc[0]["Open"]; day_low = df["Low"].min()
-    vr = curr["Volume"] / (df["VMA"].iloc[-1] + 1e-6)
-    
-    # 🛡️ 動態過濾：盤前要 2.5x 量，妖股要 1.2x，權值要 0.6x
-    min_vr = 2.5 if status == "PRE" else (1.2 if tag == "🚀 妖股" else 0.6)
-    if vr < min_vr: return None
+    if pd.isna(curr["VMA"]): return None
 
-    # --- [策略 E: 暴跌預警 (防悶殺)] --- 針對 AXTI 事件
-    # 邏輯：高位爆量滯漲 或 跌破短期支撐
-    recent_hi = df["High"].tail(20).max()
-    support_min = df["Low"].tail(5).min()
-    if curr["Close"] > recent_hi * 0.96: # 處於高位
-        if (vr > 3.5 and curr["Close"] < curr["Open"]) or (curr["Close"] < support_min):
-            return (f"{tag} ⛈️ *[暴跌預兆]* `{sym}`\n"
-                    f"💰 現價: `{curr['Close']:.2f}` · 警告: 支撐潰散\n"
-                    f"📊 動能: ⚠️ 異常放量滯漲 (量比 {vr:.1f}x)\n"
-                    f"🎫 操作: **立刻減倉** 或 平倉觀望，切勿留過夜！\n⏰ {tw_time()}")
+    vr          = curr["Volume"] / (curr["VMA"] + 1)
+    recent_hi   = df["High"].tail(20).max()
+    support_5   = df["Low"].tail(5).min()
+    is_high_pos = curr["Close"] > recent_hi * 0.94   # 處於近期高位
 
-    # --- [策略 D: 暴漲預兆 (起漲偵測)] ---
-    range_hi = df["High"].tail(6).max()
-    if vr > 3.0 and curr["Close"] > range_hi and (curr["Close"]-day_open)/day_open < 0.10:
-        return (f"{tag} 🔮 *[暴漲預兆]* `{sym}`\n"
-                f"💰 現價: `{curr['Close']:.2f}` · 蓄勢待發\n"
-                f"📊 動能: 🔥 買盤偷跑 (量比 {vr:.1f}x)\n"
-                f"🎫 操作: **現股建立底倉**，博當天噴發\n⏰ {tw_time()}")
+    # Bug修正：support 用前5根低點，不包含當根
+    c1 = is_high_pos and vr > 3.5 and curr["Close"] < curr["Open"]  # 高位爆量收黑
+    c2 = curr["Close"] < df["Low"].tail(6).iloc[:-1].min()           # 跌破5日支撐 ★修正
 
-    # --- [策略 A: 強勢突破] ---
-    orb_hi = df.iloc[0:3]["High"].max()
-    if curr["Close"] > orb_hi and prev["Close"] <= orb_hi and vr > 1.2:
-        prefix = "🌅 [盤前強勢]" if status == "PRE" else "🔥 [強勢突破]"
-        return (f"{tag} {prefix} `{sym}` 🚀\n"
-                f"💰 現價: `{curr['Close']:.2f}` · 破開盤高\n"
-                f"📊 動能: {vr:.1f}x (攻擊量)\n"
-                f"🎫 操作: **Buy Call** 或 現股追入\n⏰ {tw_time()}")
+    score = sum([c1, c2])
+    if score == 0: return None
+    g = grade(score, 2)
+    if not g: return None
 
-    # --- [策略 B: WASHOUT 殺低反彈] ---
-    drop = (day_open - day_low) / day_open * 100
-    c1 = drop > 0.8; c2 = curr["Close"] >= day_open * 0.998; c3 = curr["MA5"] > curr["MA20"]
-    if (sum([c1, c2, c3]) >= 2) and c1 and c2:
-        prefix = "🌅 [盤前洗盤]" if status == "PRE" else "⚡ [WASHOUT]"
-        return (f"{tag} {prefix} `{sym}` {grade(sum([c1,c2,c3]), 3)}\n"
-                f"💰 現價: `{curr['Close']:.2f}` · 跌幅: `{drop:.1f}%`回升\n"
-                f"📊 動能: {vr:.1f}x (低位護盤)\n⏰ {tw_time()}")
+    return {
+        "score": score + 10,  # 風險警告優先級最高
+        "msg": (
+            f"{tag} ⛈️ *[暴跌預兆]* `{sym}` {g}\n"
+            f"💰 現價: `{curr['Close']:.2f}`\n"
+            f"燈號: {L(c1)}高位爆量收黑 {L(c2)}跌破5日支撐\n"
+            f"📊 量比: `{vr:.1f}x` · RSI: `{curr['RSI']:.0f}`\n"
+            f"🚨 建議立刻減倉，切勿留過夜\n⏰ {tw_time()} TWN"
+        )
+    }
 
-    return None
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔮 暴漲預兆：縮量蓄勢突破前高（Bug修正版）
+# ══════════════════════════════════════════════════════════════════════════════
+def signal_breakout_pre(sym, tag, df5, df15):
+    if len(df5) < 20 or len(df15) < 5: return None
+    df = add_rsi(add_sma(df5, "Volume", 15, "VMA"))
+    curr = df.iloc[-1]; prev = df.iloc[-2]
+    if pd.isna(curr["VMA"]): return None
 
-# ── 主程式邏輯 (維持不變) ──
+    vr = curr["Volume"] / (curr["VMA"] + 1)
+    # Bug修正：用前5根高點最大值（排除當根）
+    prev_hi = df["High"].tail(7).iloc[:-1].max()
+    c15     = df15.iloc[-1]
+
+    c1 = vr > 2.5                               # 量能放大
+    c2 = curr["Close"] > prev_hi                # 突破前高 ★修正
+    c3 = prev["Close"] <= prev_hi               # 剛突破（非已久）
+    c4 = curr["RSI"] > 55 and curr["RSI"] < 78  # 動能強但非超買
+    c5 = c15["Close"] > prev_hi                 # 15m確認
+
+    score = sum([c1,c2,c3,c4,c5])
+    g = grade(score, 5)
+    if not g or not (c2 and c3): return None
+
+    return {
+        "score": score,
+        "msg": (
+            f"{tag} 🔮 *[暴漲預兆]* `{sym}` {g}\n"
+            f"💰 現價: `{curr['Close']:.2f}` · 突破: `{prev_hi:.2f}`\n"
+            f"燈號: {L(c1)}量2.5x {L(c2)}突破前高 {L(c3)}剛發動 {L(c4)}RSI動能 {L(c5)}15m確認\n"
+            f"📊 量比: `{vr:.1f}x` · RSI: `{curr['RSI']:.0f}` · 條件: `{score}/5`\n"
+            f"💡 現股建倉或 Buy Call\n⏰ {tw_time()} TWN"
+        )
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚡ WASHOUT：殺低反彈（門檻提高到1.5%，避免雜訊）
+# ══════════════════════════════════════════════════════════════════════════════
+def signal_washout(sym, tag, df5, df15, status):
+    if len(df5) < 6 or len(df15) < 3: return None
+    df = add_rsi(add_sma(add_sma(df5, "Volume", 10, "VMA10"), "Close", 5, "MA5"))
+    df = add_sma(df, "Close", 20, "MA20")
+    curr = df.iloc[-1]; prev = df.iloc[-2]; prev2 = df.iloc[-3]
+    if pd.isna(curr["MA5"]) or pd.isna(curr["MA20"]): return None
+
+    c15      = df15.iloc[-1]
+    day_open = df.iloc[0]["Open"]
+    day_low  = df["Low"].min()
+    yest     = df[df.index.date < df.index[-1].date()]
+    yest_low = yest["Low"].min() if not yest.empty else day_low * 0.97
+    drop     = (day_open - day_low) / day_open * 100
+    rebound  = (curr["Close"] - day_low) / (day_open - day_low + 0.001)
+    vr       = curr["Volume"] / (curr["VMA10"] + 1)
+
+    # 妖股門檻更高，避免假訊號
+    min_drop = 1.5 if "🚀" not in tag else 2.0
+
+    c1 = drop > min_drop                                  # 殺低夠深
+    c2 = curr["Close"] >= day_open * 0.998                # 站回開盤
+    c3 = prev["Close"] < day_open                         # 剛站回
+    c4 = curr["RSI"] > prev["RSI"] > prev2["RSI"]         # RSI連升
+    c5 = curr["RSI"] < 72                                 # 非追高
+    c6 = curr["Close"] > yest_low                         # 守昨低
+    c7 = rebound > 0.5                                    # 反彈力道
+    c8 = curr["MA5"] > curr["MA20"]                       # MA翻多
+
+    score = sum([c1,c2,c3,c4,c5,c6,c7,c8])
+    g = grade(score, 8)
+    if not g or not c1 or not c2: return None
+
+    prefix = "🌅 [盤前洗盤]" if status == "PRE" else "⚡ [WASHOUT]"
+    warn   = f"\n⚠️ RSI `{curr['RSI']:.0f}` 偏高，等回測5MA再加碼" if curr["RSI"] > 65 else ""
+    target = curr["Close"] * 1.02
+    stop   = yest_low
+
+    return {
+        "score": score,
+        "msg": (
+            f"{tag} {prefix} `{sym}` {g}\n"
+            f"💰 現價: `{curr['Close']:.2f}` · 殺低: `{drop:.1f}%` · 反彈: `{rebound*100:.0f}%`\n"
+            f"燈號: {L(c1)}殺低 {L(c2)}站回 {L(c3)}剛翻 {L(c4)}RSI勾 "
+            f"{L(c5)}非追高 {L(c6)}守昨低 {L(c7)}彈力 {L(c8)}MA翻多\n"
+            f"📊 RSI: `{curr['RSI']:.0f}` · 量比: `{vr:.1f}x` · 條件: `{score}/8`{warn}\n"
+            f"🎯 目標: `{target:.2f}` (+2%) · 止損: `{stop:.2f}`\n"
+            f"👉 TradingView 5m 確認\n⏰ {tw_time()} TWN"
+        )
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📈 波段PULLBACK：縮量回測季線（最高勝率）
+# ══════════════════════════════════════════════════════════════════════════════
+def signal_pullback(sym, tag, df1d, df5):
+    if len(df1d) < 65 or len(df5) < 3: return None
+    d = add_macd(add_rsi(add_sma(add_sma(df1d, "Close", 60, "MA60"), "Volume", 5, "V5")))
+    f = add_rsi(df5)
+
+    d_c=d.iloc[-1]; d_p=d.iloc[-2]; f_c=f.iloc[-1]; f_p=f.iloc[-2]
+    if pd.isna(d_c["MA60"]) or pd.isna(d_c["RSI"]): return None
+
+    bias60 = (d_c["Close"] - d_c["MA60"]) / d_c["MA60"] * 100
+    vr     = d_c["Volume"] / (d_c["V5"] + 1)
+
+    c1 = d_c["Close"] > d_c["MA60"]
+    c2 = 42 <= d_p["RSI"] <= 58 and d_c["RSI"] > d_p["RSI"]
+    c3 = vr < 0.85
+    c4 = 0 <= bias60 < 5
+    c5 = f_c["RSI"] > f_p["RSI"]
+    c6 = d_c["MACD_hist"] > d_p["MACD_hist"]
+
+    score = sum([c1,c2,c3,c4,c5,c6])
+    g = grade(score, 6)
+    if not g or not c1 or not c2: return None
+
+    sp = d_c["Close"] * 0.95
+    return {
+        "score": score,
+        "msg": (
+            f"{tag} 📈 *[波段PULLBACK]* `{sym}` {g}\n"
+            f"💰 現價: `{d_c['Close']:.2f}` · 距季線: `{bias60:.1f}%`\n"
+            f"燈號: {L(c1)}季線上 {L(c2)}RSI勾頭 {L(c3)}縮量 "
+            f"{L(c4)}貼季線 {L(c5)}5m確認 {L(c6)}MACD放大\n"
+            f"📊 日RSI: `{d_c['RSI']:.0f}` · 量能: `{vr:.2f}x` · 條件: `{score}/6`\n"
+            f"💡 Sell Put 行權價: `{sp:.1f}` (-5%) · 守季線\n⏰ {tw_time()} TWN"
+        )
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ₿ 加密（yfinance 1h，Binance數據延遲小）
+# ══════════════════════════════════════════════════════════════════════════════
+def signal_crypto(yf_sym, disp, df1h):
+    if len(df1h) < 60: return None
+    df = add_macd(add_rsi(df1h.copy()))
+    df["EMA50"]  = ta.trend.EMAIndicator(df["Close"], window=50).ema_indicator()
+    df["V_MA20"] = ta.trend.SMAIndicator(df["Volume"], window=20).sma_indicator()
+
+    curr=df.iloc[-1]; prev=df.iloc[-2]
+    if pd.isna(curr["RSI"]) or pd.isna(curr["MACD"]): return None
+
+    price = curr["Close"]
+    ema50 = curr["EMA50"]
+    vr    = curr["Volume"] / (curr["V_MA20"] + 1)
+    r     = curr["RSI"]
+
+    results = []
+
+    # MACD翻零軸（最強信號，直接S級）
+    if curr["MACD"] > 0 and prev["MACD"] <= 0 and price > ema50:
+        results.append({"score": 10, "msg": (
+            f"₿ 🔥 *[加密 MACD翻零軸]* `{disp}` 🏆 S級\n"
+            f"💰 現價: `{price:.4f}`\n"
+            f"📊 MACD: `{prev['MACD']:.4f}` → `{curr['MACD']:.4f}` 翻正\n"
+            f"💡 中線做多強信號\n⏰ {tw_time()} TWN"
+        )})
+
+    # PULLBACK
+    cp1=price>ema50; cp2=42<=prev["RSI"]<=58 and r>prev["RSI"]
+    cp3=curr["MACD"]>0; cp4=vr<0.85; cp5=curr["MACD_hist"]>prev["MACD_hist"]
+    sc = sum([cp1,cp2,cp3,cp4,cp5])
+    g  = grade(sc, 5)
+    if g and cp1 and cp2:
+        bias = (price-ema50)/ema50*100
+        results.append({"score": sc, "msg": (
+            f"₿ 📈 *[加密 PULLBACK]* `{disp}` {g}\n"
+            f"💰 現價: `{price:.4f}` · 距EMA50: `{bias:.1f}%`\n"
+            f"燈號: {L(cp1)}EMA50上 {L(cp2)}RSI勾頭 {L(cp3)}MACD>0 {L(cp4)}縮量 {L(cp5)}柱放大\n"
+            f"📊 RSI: `{r:.0f}` · 條件: `{sc}/5`\n"
+            f"💡 做多 · 止損EMA50\n⏰ {tw_time()} TWN"
+        )})
+
+    return results if results else None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主程式：收集 → 分區排序 → 發送
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
-    status = get_market_status()
-    if status == "CLOSED": return
-    for tag, syms in TICKERS.items():
-        if tag in ["🇹🇼 台股", "₿ 加密"]: continue
-        for sym in syms:
-            df5 = get_data(sym, "5m", "2d")
-            if df5.empty: continue 
-            msg = scan_logic(sym, tag, df5)
-            if msg: send_tg(msg)
+    status = us_market_status()
+    tw_now = datetime.now(pytz.timezone("Asia/Taipei"))
+    print(f"\n{'='*50}")
+    print(f"CC Scanner v7.1 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"美股:{status} | 台股:{'開盤' if is_tw_open() else '休市'} | 加密:24/7")
+    print(f"數據源：Alpaca({'✓' if ALPACA_KEY else '✗'}) / yfinance")
+    print(f"{'='*50}")
 
-if __name__ == "__main__": main()
+    intraday_sigs = []
+    swing_sigs    = []
+    crypto_sigs   = []
+
+    # ── 美股（Alpaca即時數據）────────────────────────────────────────────────
+    if status in ("PRE","OPEN"):
+        us_tags = ["🇺🇸","🛡️","⚛️","🚀","🇨🇳"]
+        for tag in us_tags:
+            for sym in TICKERS.get(tag, []):
+                try:
+                    # 優先用 Alpaca，fallback 到 yfinance
+                    df5  = get_alpaca_5m(sym)
+                    df15 = get_alpaca_15m(sym)
+                    if df5.empty:
+                        print(f"  {sym}: Alpaca無數據，改用yfinance")
+                        df5  = get_yf_5m(sym)
+                        df15 = get_yf_15m(sym)
+                    if df5.empty: continue
+
+                    for fn in [
+                        lambda s,t,d5,d15: signal_crash_warning(s, t, d5),
+                        signal_breakout_pre,
+                        lambda s,t,d5,d15: signal_washout(s, t, d5, d15, status),
+                    ]:
+                        r = fn(sym, tag, df5, df15)
+                        if r: intraday_sigs.append(r)
+                except Exception as e:
+                    print(f"  {sym}: {e}")
+
+    # ── 美股波段（收盤前30分，用yfinance日線）────────────────────────────────
+    if is_us_swing():
+        for tag in ["🇺🇸","🛡️","🚀"]:
+            for sym in TICKERS.get(tag, []):
+                try:
+                    df1d = get_yf_1d(sym)
+                    df5  = get_alpaca_5m(sym) or get_yf_5m(sym)
+                    if not df1d.empty and not df5.empty:
+                        r = signal_pullback(sym, tag, df1d, df5)
+                        if r: swing_sigs.append(r)
+                except Exception as e:
+                    print(f"  {sym}: {e}")
+
+    # ── 台股（yfinance，有15分延遲，波段為主）────────────────────────────────
+    if is_tw_open():
+        for sym in TICKERS["🇹🇼"]:
+            try:
+                df5  = get_yf_5m(sym)
+                df15 = get_yf_15m(sym)
+                if df5.empty: continue
+                for fn in [signal_breakout_pre, lambda s,t,d5,d15: signal_washout(s,t,d5,d15,"OPEN")]:
+                    r = fn(sym, "🇹🇼", df5, df15)
+                    if r: intraday_sigs.append(r)
+            except Exception as e:
+                print(f"  {sym}: {e}")
+
+    if is_tw_swing():
+        for sym in TICKERS["🇹🇼"]:
+            try:
+                df1d = get_yf_1d(sym); df5 = get_yf_5m(sym)
+                if not df1d.empty and not df5.empty:
+                    r = signal_pullback(sym, "🇹🇼", df1d, df5)
+                    if r: swing_sigs.append(r)
+            except Exception as e:
+                print(f"  {sym}: {e}")
+
+    # ── 加密（24/7）─────────────────────────────────────────────────────────
+    for yf_sym, disp in TICKERS["₿"]:
+        try:
+            df1h = get_yf_1h(yf_sym)
+            if df1h.empty: continue
+            results = signal_crypto(yf_sym, disp, df1h)
+            if results: crypto_sigs.extend(results)
+        except Exception as e:
+            print(f"  {disp}: {e}")
+
+    # ── 排序（分數高優先）+ 分區發送 ────────────────────────────────────────
+    intraday_sigs.sort(key=lambda x: x["score"], reverse=True)
+    swing_sigs.sort(key=lambda x:    x["score"], reverse=True)
+    crypto_sigs.sort(key=lambda x:   x["score"], reverse=True)
+
+    if intraday_sigs:
+        send_tg(f"━━━ ⚡ 日內信號 · {len(intraday_sigs)}個 ━━━")
+        for s in intraday_sigs: send_tg(s["msg"])
+
+    if swing_sigs:
+        send_tg(f"━━━ 📈 波段信號 · {len(swing_sigs)}個 ━━━")
+        for s in swing_sigs: send_tg(s["msg"])
+
+    if crypto_sigs:
+        send_tg(f"━━━ ₿ 加密信號 · {len(crypto_sigs)}個 ━━━")
+        for s in crypto_sigs: send_tg(s["msg"])
+
+    if not any([intraday_sigs, swing_sigs, crypto_sigs]):
+        print("本次無S/A級信號")
+
+    print("掃描結束\n")
+
+if __name__ == "__main__":
+    main()
