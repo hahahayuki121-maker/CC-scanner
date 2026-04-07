@@ -1,10 +1,11 @@
-“””
+"""
 CC Market Scanner v7.1
 數據源：Alpaca API（美股即時）/ yfinance（台股、加密、日線）
 標籤：🇺🇸權值 | 🛡️資安 | ⚛️核能 | 🚀妖股 | 🇨🇳中概 | 🇹🇼台股 | ₿加密
 策略：⛈️暴跌預兆 | 🔮暴漲預兆 | 🔥強勢突破 | ⚡WASHOUT | 📈波段PULLBACK
 等級：S級/A級（B級已移除）
-“””
+"""
+
 
 import requests
 import pandas as pd
