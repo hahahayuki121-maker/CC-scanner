@@ -47,11 +47,11 @@ TW_HOLIDAYS = {
 }
 # ── 時間判斷 ──────────────────────────────────────────────────────────────────
 def _now_ny():
-return datetime.now(pytz.timezone("America/New_York"))
+    return datetime.now(pytz.timezone("America/New_York"))
 def _now_tw():
-return datetime.now(pytz.timezone("Asia/Taipei"))
+    return datetime.now(pytz.timezone("Asia/Taipei"))
 def us_market_status():
-ny = _now_ny()
+    ny = _now_ny()
 d = ny.strftime("%Y-%m-%d")
 if ny.weekday() >= 5 or d in US_HOLIDAYS:
 return "CLOSED"
@@ -67,13 +67,13 @@ if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
 m = tw.hour * 60 + tw.minute
 return 540 <= m < 810
 def is_tw_swing():
-tw = _now_tw()
+    tw = _now_tw()
 d = tw.strftime("%Y-%m-%d")
 if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
 m = tw.hour * 60 + tw.minute
 return 780 <= m < 810
 def is_us_swing():
-ny = _now_ny()
+    ny = _now_ny()
 d = ny.strftime("%Y-%m-%d")
 if ny.weekday() >= 5 or d in US_HOLIDAYS: return False
 m = ny.hour * 60 + ny.minute
