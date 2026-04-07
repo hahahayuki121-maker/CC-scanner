@@ -490,5 +490,3 @@ def main():
         print("本次無S/A級信號")
 
     print("掃描結束\n")
-
-if __name__ == "__main__":
