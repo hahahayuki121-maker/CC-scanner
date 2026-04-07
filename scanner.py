@@ -54,29 +54,29 @@ def us_market_status():
     ny = _now_ny()
 d = ny.strftime("%Y-%m-%d")
 if ny.weekday() >= 5 or d in US_HOLIDAYS:
-return "CLOSED"
+    return "CLOSED"
 m = ny.hour * 60 + ny.minute
 if 240 <= m < 570: return "PRE"
 if 570 <= m < 930: return "OPEN"
 if 930 <= m < 1200: return "POST"
-return "CLOSED"
+    return "CLOSED"
 def is_tw_open():
 tw = _now_tw()
 d = tw.strftime("%Y-%m-%d")
 if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
 m = tw.hour * 60 + tw.minute
-return 540 <= m < 810
+    return 540 <= m < 810
 def is_tw_swing():
     tw = _now_tw()
 d = tw.strftime("%Y-%m-%d")
 if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
 m = tw.hour * 60 + tw.minute
-return 780 <= m < 810
+    return 780 <= m < 810
 def is_us_swing():
     ny = _now_ny()
 d = ny.strftime("%Y-%m-%d")
 if ny.weekday() >= 5 or d in US_HOLIDAYS: return False
 m = ny.hour * 60 + ny.minute
-return 900 <= m < 930
+    return 900 <= m < 930
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_tg(msg):
