@@ -40,12 +40,24 @@ TICKERS = {
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
     "🚀": ["COIN","MSTR","MARA","CLSK","HOOD","SOFI",
-            "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS"],
+            "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS",
+            "AEHR",   # Aehr Test — 矽光子 burn-in，AI數據中心，今年+158%
+            "AXTI",   # AXT Inc — 磷化銦基板，AI光纖，高beta妖股
+            "ACMR",   # ACM Research — 半導體清洗設備，中概+AI
+            "KTOS",   # Kratos Defense — 無人機/超音速，國防妖股
+            "SERV",   # Serve Robotics — 食品配送機器人，Uber生態
+    ],
     "🇨🇳": ["BABA","PDD","FUTU"],
     "🇹🇼": ["2330.TW","00631L.TW"],
     "₿":   [("BTC-USD","BTC/USDT"),("ETH-USD","ETH/USDT"),("ETH-BTC","ETH/BTC")],
 }
 VOLATILE_TAGS = {"🚀", "⚛️"}
+
+# ── 盤前量能掃描名單（抓 AXTI/AEHR 跳空行情）────────────────────────────────
+PREMARKET_WATCHLIST = [
+    "AEHR","AXTI","ACMR","KTOS","SERV","AAOI","RCAT",
+    "IONQ","RGTI","NVTS","APLD","SMR","OKLO","NNE",
+]
 
 # ── 假日清單 ──────────────────────────────────────────────────────────────────
 US_HOLIDAYS = {
@@ -62,8 +74,10 @@ TW_HOLIDAYS = {
     "2026-06-19","2026-09-26","2026-10-09","2026-10-10",
 }
 
-# ── 冷卻（檔案儲存，跨 Actions 執行有效）────────────────────────────────────
-CACHE_FILE = "/tmp/cc_scanner_cache.json"
+# ── 冷卻（git repo 持久化，跨 Actions 執行有效）─────────────────────────────
+# /tmp 在每次 GitHub Actions 執行都會清空，導致冷卻失效
+# 改存到 repo 根目錄，並在掃描結束後 git commit 回去
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scanner_cache.json")
 
 def load_cache():
     try:
@@ -72,8 +86,21 @@ def load_cache():
 
 def save_cache(c):
     try:
-        with open(CACHE_FILE, "w") as f: json.dump(c, f)
-    except: pass
+        with open(CACHE_FILE, "w") as f: json.dump(c, f, indent=2)
+        # 自動 git commit 回 repo（需要 Actions 有 write 權限）
+        import subprocess
+        subprocess.run(["git", "config", "user.email", "cc-scanner@github-actions"], check=False)
+        subprocess.run(["git", "config", "user.name",  "CC Scanner Bot"],             check=False)
+        subprocess.run(["git", "add", CACHE_FILE],                                    check=False)
+        result = subprocess.run(
+            ["git", "commit", "-m", f"chore: update scanner cache {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"],
+            capture_output=True, text=True
+        )
+        if "nothing to commit" not in result.stdout:
+            subprocess.run(["git", "push"], check=False)
+            print("  ✓ cache 已同步回 repo")
+    except Exception as e:
+        print(f"  ⚠️ cache 儲存失敗: {e}")
 
 def is_cooled(cache, key, mins=30):
     if key not in cache: return True
@@ -406,6 +433,89 @@ def signal_surge(sym, tag, df5, df15, source, cache):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 🌅 盤前量能掃描（抓 AXTI/AEHR 這類跳空妖股）
+# 核心邏輯：盤前漲幅 > 5% 且盤前成交量 > 日均量 1.5x → 即時警報
+# 技術指標在跳空行情失效，這裡純粹靠量價結構
+# ══════════════════════════════════════════════════════════════════════════════
+def signal_premarket_gap(sym, cache):
+    """
+    盤前跳空掃描：用 Polygon 盤前數據 + 日線均量比對
+    觸發條件（全部必要）：
+      G1: 盤前價格 vs 昨收 漲幅 > 5%
+      G2: 盤前成交量 > 5日均量 × 1.5（有機構參與）
+      G3: 昨日收盤 RSI < 70（非超買起跳，避免追高）
+      G4: 盤前量能在最近 30 分鐘仍在放大（不是一次性刷量）
+    冷卻：同標的當日只發一次
+    """
+    ck = f"pregap_{sym}_{_ny().strftime('%Y%m%d')}"
+    if not is_cooled(cache, ck, 60 * 12): return None  # 當日冷卻
+
+    try:
+        # 盤前 1 分鐘 K 線（Polygon 付費可取得盤前數據）
+        pre_df = get_polygon_bars(sym, 1, "minute", 90)
+        if pre_df.empty: return None
+
+        # 過濾只留盤前時段（NY 04:00–09:30）
+        ny_today = _ny().date()
+        pre_only = pre_df[
+            (pre_df.index.date == ny_today) &
+            (pre_df.index.hour < 9) |
+            ((pre_df.index.hour == 9) & (pre_df.index.minute < 30))
+        ]
+        if len(pre_only) < 5: return None
+
+        # 日線數據取昨收 + 5 日均量
+        df1d = get_yf(sym, "1d", "20d")
+        if len(df1d) < 6: return None
+        yest_close  = float(df1d["Close"].iloc[-2])
+        avg_vol_5d  = float(df1d["Volume"].tail(5).mean())
+
+        pre_last    = pre_only.iloc[-1]
+        pre_price   = float(pre_last["Close"])
+        pre_vol     = float(pre_only["Volume"].sum())        # 盤前累計成交量
+        pre_chg_pct = (pre_price - yest_close) / yest_close * 100
+
+        # 昨日 RSI
+        df1d_rsi = add_rsi(df1d)
+        yest_rsi = float(df1d_rsi["RSI"].iloc[-2]) if not pd.isna(df1d_rsi["RSI"].iloc[-2]) else 50
+
+        # 最近 30 分鐘量能是否持續（非一次性）
+        recent_30 = pre_only.tail(30)
+        vol_accel  = float(recent_30["Volume"].tail(10).mean()) > float(recent_30["Volume"].head(10).mean()) * 0.8
+
+        G1 = pre_chg_pct > 5.0
+        G2 = pre_vol > avg_vol_5d * 1.5
+        G3 = yest_rsi < 70
+        G4 = vol_accel
+
+        if not (G1 and G2): return None  # G1/G2 必要
+        score_raw = sum([G1, G2, G3, G4])
+        g = "🏆 S級" if score_raw == 4 else "🥇 A級"
+
+        mark_sent(cache, ck)
+        vol_ratio = pre_vol / (avg_vol_5d + 1)
+        warn = " ⚠️ 昨日RSI偏高，注意高開低走" if yest_rsi >= 65 else ""
+        advice = (
+            f"盤前爆量跳空+{pre_chg_pct:.1f}%，開盤前5分鐘觀察是否縮量回測，"
+            f"確認站穩再進，止損昨收{yest_close:.2f}{warn}"
+        )
+        return {
+            "score": score_raw + 8, "type": "🌅",
+            "msg": (
+                f"🚀 🌅 *[盤前跳空警報]* `{sym}` {g}\n"
+                f"💰 盤前價: `{pre_price:.2f}` · 📈: `{pre_chg_pct:+.1f}%`（vs 昨收`{yest_close:.2f}`）\n"
+                f"📊 盤前量: `{vol_ratio:.1f}x` 日均量 · 昨RSI: `{yest_rsi:.0f}`\n"
+                f"燈號: {L(G1)}跳空>5% {L(G2)}放量>1.5x {L(G3)}RSI未超買 {L(G4)}量能持續\n"
+                f"🎫 *[盤前機會]*: {advice}\n"
+                f"⚠️ 跳空行情技術指標失效，純量價判斷，風險較高\n"
+                f"⏰ {tw_time()} TWN"
+            )
+        }
+    except Exception as e:
+        print(f"  盤前掃描 {sym}: {e}")
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ⚡ WASHOUT
 # ══════════════════════════════════════════════════════════════════════════════
 def signal_washout(sym, tag, df5, df15, status, cache):
@@ -641,7 +751,7 @@ def format_digest(sigs, label):
     if not intra and not swing and not crypto:
         lines.append("本次無 S/A 級信號，繼續等待")
 
-    lines += ["━━━━━━━━━━━━━━━", "開盤後僅發 ⛈️ 緊急警示"]
+    lines += ["━━━━━━━━━━━━━━━", "S級即時通知 · A級彙整發送"]
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -654,7 +764,7 @@ def main():
     cache  = load_cache()
 
     print(f"\n{'='*55}")
-    print(f"CC Scanner v8.0 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"CC Scanner v8.2 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
     print(f"美股:{status} | 模式:{mode}")
     print(f"Polygon:{'✓' if POLYGON_KEY else '✗'} | Alpaca:{'✓' if ALPACA_KEY else '✗'}")
     print(f"{'='*55}")
@@ -680,6 +790,17 @@ def main():
                         if r: all_sigs.append(r)
                 except Exception as e:
                     print(f"  {sym}: {e}")
+
+    # ── 盤前跳空掃描（抓 AXTI/AEHR 類跳空妖股，PRE 時段獨立執行）──────────────
+    if status == "PRE":
+        # 合併主清單妖股 + 盤前專屬觀察清單，去重
+        all_pre_syms = list(set(TICKERS.get("🚀", []) + TICKERS.get("⚛️", []) + PREMARKET_WATCHLIST))
+        for sym in all_pre_syms:
+            try:
+                r = signal_premarket_gap(sym, cache)
+                if r: all_sigs.append(r)
+            except Exception as e:
+                print(f"  盤前{sym}: {e}")
 
     # ── 美股波段 ──────────────────────────────────────────────────────────────
     if is_us_swing() or mode == "DIGEST_PRE":
