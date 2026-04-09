@@ -86,7 +86,7 @@ jobs:
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-        run: python cc_scanner_v8.py
+        run: python scanner.py
 
       - name: Upload scan log (保留7天)
         if: always()
