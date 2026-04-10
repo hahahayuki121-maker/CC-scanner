@@ -35,7 +35,7 @@ TICKERS = {
              "AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB","QQQ","ASX","INTC"],
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
-    "🚀": ["CRCL",”COIN","MSTR","MARA","CLSK","HOOD","SOFI",
+    "🚀": ["CRCL","COIN","MSTR","MARA","CLSK","HOOD","SOFI",
             "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS",
             "AXTI","AEHR","ACMR","KTOS","SERV"],
     "🇹🇼": ["2330.TW","00631L.TW"],
