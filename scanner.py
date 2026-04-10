@@ -32,10 +32,10 @@ _crash_warned = set()   # 頂層定義，避免信號函數載入時報錯
 # ── 監控名單（移除中概，新增指定標的）────────────────────────────────────────
 TICKERS = {
     "🇺🇸": ["NVDA","AVGO","ANET","VRT","VST","TSLA","AMD","AMZN",
-             "AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB","QQQ”,”ASX”,”INTC”],
+             "AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB","QQQ","ASX","INTC"],
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
-    "🚀": [“CRCL”,”COIN","MSTR","MARA","CLSK","HOOD","SOFI",
+    "🚀": ["CRCL",”COIN","MSTR","MARA","CLSK","HOOD","SOFI",
             "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS",
             "AXTI","AEHR","ACMR","KTOS","SERV"],
     "🇹🇼": ["2330.TW","00631L.TW"],
