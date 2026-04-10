@@ -1,42 +1,42 @@
 name: CC Market Scanner v8.2
 
 on:
-  schedule:
-    # ── 盤前匯總視窗（夏令 EDT = UTC-4）─────────────────────────────────────
-    # 開盤前30分 ET 09:00 = UTC 13:00
-    - cron: '0 13 * * 1-5'
-    # 開盤前15分 ET 09:15 = UTC 13:15
-    - cron: '15 13 * * 1-5'
-    # 開盤當下  ET 09:30 = UTC 13:30
-    - cron: '30 13 * * 1-5'
+  schedule:
+    # ── 盤前匯總視窗（夏令 EDT = UTC-4）─────────────────────────────────────
+    # 開盤前30分 ET 09:00 = UTC 13:00
+    - cron: '0 13 * * 1-5'
+    # 開盤前15分 ET 09:15 = UTC 13:15
+    - cron: '15 13 * * 1-5'
+    # 開盤當下  ET 09:30 = UTC 13:30
+    - cron: '30 13 * * 1-5'
 
-    # ── 盤中（每15分鐘，ET 09:45~16:00 = UTC 13:45~20:00）──────────────────
-    - cron: '45 13 * * 1-5'
-    - cron: '0,15,30,45 14 * * 1-5'
-    - cron: '0,15,30,45 15 * * 1-5'
-    - cron: '0,15,30,45 16 * * 1-5'
-    - cron: '0,15,30,45 17 * * 1-5'
-    - cron: '0,15,30,45 18 * * 1-5'
-    - cron: '0,15,30,45 19 * * 1-5'
-    # 波段收盤前 ET 15:55 = UTC 19:55
-    - cron: '55 19 * * 1-5'
+    # ── 盤中（每15分鐘，ET 09:45~16:00 = UTC 13:45~20:00）──────────────────
+    - cron: '45 13 * * 1-5'
+    - cron: '0,15,30,45 14 * * 1-5'
+    - cron: '0,15,30,45 15 * * 1-5'
+    - cron: '0,15,30,45 16 * * 1-5'
+    - cron: '0,15,30,45 17 * * 1-5'
+    - cron: '0,15,30,45 18 * * 1-5'
+    - cron: '0,15,30,45 19 * * 1-5'
+    # 波段收盤前 ET 15:55 = UTC 19:55
+    - cron: '55 19 * * 1-5'
 
-    # ── 台股（UTC+8，台灣 09:00 = UTC 01:00）────────────────────────────────
-    - cron: '0,30 1 * * 1-5'
-    # 台股收盤前波段（台灣 13:00 = UTC 05:00）
-    - cron: '0 5 * * 1-5'
+    # ── 台股（UTC+8，台灣 09:00 = UTC 01:00）────────────────────────────────
+    - cron: '0,30 1 * * 1-5'
+    # 台股收盤前波段（台灣 13:00 = UTC 05:00）
+    - cron: '0 5 * * 1-5'
 
-    # ── 加密半木夏（24/7，每30分鐘）────────────────────────────────────────
-    - cron: '0,30 * * * *'
+    # ── 加密半木夏（24/7，每30分鐘）────────────────────────────────────────
+    - cron: '0,30 * * * *'
 
-  workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25   # 防止掃描卡死
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12   # 固定名單+5支VCP約5~8分鐘，12分鐘足夠
 
-    steps:
+    steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -45,30 +45,40 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip
-        uses: actions/cache@v4
+      # 新增：讀取快取檔案，讓冷卻機制跨執行有效
+      - name: Restore Scan Cache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v8
-          restore-keys: ${{ runner.os }}-pip-
+          path: /tmp/cc_cache.json
+          key: cc-scanner-cache-${{ github.run_id }}
+          restore-keys: |
+            cc-scanner-cache-
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install requests pandas numpy yfinance ta pytz
 
-      - name: Run CC Scanner v8.2
+      - name: Run CC Scanner v8.5
         env:
           TG_TOKEN:      ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
+          POLYGON_KEY:   ${{ secrets.POLYGON_KEY }}
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
         run: python cc_scanner_v8.py 2>&1 | tee scan.log
 
-      - name: Upload scan log
+      # 新增：存回快取檔案
+      - name: Save Scan Cache
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: scan-log-${{ github.run_id }}
-          path: scan.log
-          retention-days: 7
+          path: /tmp/cc_cache.json
+          key: cc-scanner-cache-${{ github.run_id }}
+
+      - name: Upload scan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-log-${{ github.run_id }}
+          path: scan.log
+          retention-days: 7
