@@ -1,74 +1,52 @@
-name: CC Market Scanner v8.7
+name: CC Market Scanner
 
 on:
   schedule:
     - cron: '*/5 * * * *'
-    - cron: '0 13 * * 1-5'
-    - cron: '15 13 * * 1-5'
-    - cron: '25 13 * * 1-5'
-    - cron: '30 13 * * 1-5'
-    - cron: '45 13 * * 1-5'
-    - cron: '0,15,30,45 14-19 * * 1-5'
-    - cron: '55 19 * * 1-5'
-    - cron: '0,30 1 * * 1-5'
-    - cron: '0 5 * * 1-5'
-    - cron: '0,30 * * * *'
-
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 8
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Restore Scan Cache
+      - name: Restore scanner cache
         uses: actions/cache/restore@v4
         with:
           path: /tmp/cc_cache.json
           key: cc-scanner-cache-v8.7
-          restore-keys: |
-            cc-scanner-cache-
+          restore-keys: cc-scanner-cache-
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v8.7
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install requests pandas numpy yfinance ta pytz
+        run: pip install -r requirements.txt
 
-      - name: Run CC Scanner v8.7
+      - name: Run scanner
         env:
-          TG_TOKEN:      ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
-          ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-        run: python cc_scanner_v8.7.py 2>&1 | tee scan.log
+          EXTRA_VCP: ${{ secrets.EXTRA_VCP }}
+        run: python scanner.py
 
-      - name: Save Scan Cache
-        if: always()
+      - name: Save scanner cache
         uses: actions/cache/save@v4
+        if: always()
         with:
           path: /tmp/cc_cache.json
           key: cc-scanner-cache-v8.7
-
-      - name: Upload scan log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-log-${{ github.run_id }}
-          path: scan.log
-          retention-days: 7
