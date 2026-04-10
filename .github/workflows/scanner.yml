@@ -1,42 +1,39 @@
-name: CC Market Scanner v8.2
+name: CC Market Scanner v8.5
 
 on:
-  schedule:
-    # ── 盤前匯總視窗（夏令 EDT = UTC-4）─────────────────────────────────────
-    # 開盤前30分 ET 09:00 = UTC 13:00
-    - cron: '0 13 * * 1-5'
-    # 開盤前15分 ET 09:15 = UTC 13:15
-    - cron: '15 13 * * 1-5'
-    # 開盤當下  ET 09:30 = UTC 13:30
-    - cron: '30 13 * * 1-5'
+  schedule:
+    # ── 盤前匯總視窗 (2026 夏令 EDT = UTC-4) ─────────────────────────────────────
+    # 開盤前30分 ET 09:00 = UTC 13:00
+    - cron: '0 13 * * 1-5'
+    # 開盤前15分 ET 09:15 = UTC 13:15
+    - cron: '15 13 * * 1-5'
+    # 關鍵：開盤前5分 ET 09:25 (捕捉妖股最後突襲)
+    - cron: '25 13 * * 1-5'
+    # 開盤當下   ET 09:30 = UTC 13:30
+    - cron: '30 13 * * 1-5'
 
-    # ── 盤中（每15分鐘，ET 09:45~16:00 = UTC 13:45~20:00）──────────────────
-    - cron: '45 13 * * 1-5'
-    - cron: '0,15,30,45 14 * * 1-5'
-    - cron: '0,15,30,45 15 * * 1-5'
-    - cron: '0,15,30,45 16 * * 1-5'
-    - cron: '0,15,30,45 17 * * 1-5'
-    - cron: '0,15,30,45 18 * * 1-5'
-    - cron: '0,15,30,45 19 * * 1-5'
-    # 波段收盤前 ET 15:55 = UTC 19:55
-    - cron: '55 19 * * 1-5'
+    # ── 盤中 (每15分鐘，ET 09:45~16:00 = UTC 13:45~20:00) ──────────────────
+    - cron: '45 13 * * 1-5'
+    - cron: '0,15,30,45 14-19 * * 1-5'
+    # 波段收盤前 ET 15:55 = UTC 19:55
+    - cron: '55 19 * * 1-5'
 
-    # ── 台股（UTC+8，台灣 09:00 = UTC 01:00）────────────────────────────────
-    - cron: '0,30 1 * * 1-5'
-    # 台股收盤前波段（台灣 13:00 = UTC 05:00）
-    - cron: '0 5 * * 1-5'
+    # ── 台股 (UTC+8，台灣 09:00 = UTC 01:00) ────────────────────────────────
+    - cron: '0,30 1 * * 1-5'
+    # 台股收盤前波段 (台灣 13:00 = UTC 05:00)
+    - cron: '0 5 * * 1-5'
 
-    # ── 加密半木夏（24/7，每30分鐘）────────────────────────────────────────
-    - cron: '0,30 * * * *'
+    # ── 加密半木夏 (24/7，每30分鐘) ────────────────────────────────────────
+    - cron: '0,30 * * * *'
 
-  workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12   # 固定名單+5支VCP約5~8分鐘，12分鐘足夠
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-    steps:
+    steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -45,7 +42,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 新增：讀取快取檔案，讓冷卻機制跨執行有效
+      # ★ 核心改進：讀取冷卻快取檔案，避免重複通知
       - name: Restore Scan Cache
         uses: actions/cache/restore@v4
         with:
@@ -54,8 +51,16 @@ jobs:
           restore-keys: |
             cc-scanner-cache-
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-v8.5
+          restore-keys: ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install requests pandas numpy yfinance ta pytz
 
       - name: Run CC Scanner v8.5
@@ -65,9 +70,10 @@ jobs:
           POLYGON_KEY:   ${{ secrets.POLYGON_KEY }}
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          # EXTRA_VCP: "TSLA,AAPL"
         run: python cc_scanner_v8.py 2>&1 | tee scan.log
 
-      # 新增：存回快取檔案
+      # ★ 核心改進：存回快取檔案，讓下一次執行知道哪些股票發過訊號了
       - name: Save Scan Cache
         if: always()
         uses: actions/cache/save@v4
@@ -76,9 +82,9 @@ jobs:
           key: cc-scanner-cache-${{ github.run_id }}
 
       - name: Upload scan log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-log-${{ github.run_id }}
-          path: scan.log
-          retention-days: 7
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-log-${{ github.run_id }}
+          path: scan.log
+          retention-days: 7
