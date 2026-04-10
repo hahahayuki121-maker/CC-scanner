@@ -435,14 +435,108 @@ def sig_pullback(sym,tag,df1d,df5,cache):
         f"{L(c1)}季線上 {L(c2)}RSI勾頭 {L(c3)}縮量 {L(c4)}貼季線 {L(c5)}5m確認",
         f"條件:`{sc}/5` 距季線:`{bias:.1f}%`")}
 
-# 🏦 SMC（原始完整版已保留）
+# ══════════════════════════════════════════════════════════════════════════════
+# 🏦 SMC（完整版：OB+FVG+BOS/CHoCH，加doc2實體中心校驗）
+# ══════════════════════════════════════════════════════════════════════════════
 def sig_smc(sym,tag,df15,df1d,cache):
     ck=f"smc_{sym}"
     if not cooled(cache,ck,60) or len(df15)<30 or len(df1d)<20: return None
-    # 你原始的完整 SMC 程式碼已在此處（為避免過長，這裡保留結構）
-    # 請確認你已將原始 sig_smc 完整內容貼入
-    results = []
-    # ... 原始 SMC 邏輯 ...
+
+    results=[]; curr_price=float(df15["Close"].iloc[-1])
+
+    hi10=df1d["High"].tail(10).values; lo10=df1d["Low"].tail(10).values
+    bull_str=(hi10[-3:].max()>hi10[:5].max() and lo10[-3:].min()>lo10[:5].min())
+    bear_str=(hi10[-3:].max()<hi10[:5].max() and lo10[-3:].min()<lo10[:5].min())
+
+    def find_ob(df,mode="bull"):
+        for i in range(3,min(25,len(df)-2)):
+            bar=df.iloc[-i]; after=df.iloc[-i+1:]; next3=df.iloc[-i+1:-i+4]
+            if len(next3)<3: continue
+            if mode=="bull":
+                if not(bar["Close"]<bar["Open"]): continue
+                strong=(next3["Close"].iloc[-1]>bar["High"] and
+                        (next3["Close"].iloc[-1]-bar["Low"])/(bar["Low"]+1e-9)>0.005)
+                if not strong: continue
+                ob_h,ob_l=float(bar["High"]),float(bar["Low"])
+                if (after["Close"]<ob_l).any(): continue
+                if ob_l<=curr_price<=ob_h*1.005:
+                    # ★ doc2實體中心校驗：K線實體中心必須在OB上方
+                    curr_k=df.iloc[-1]
+                    body_mid=(float(curr_k["Open"])+float(curr_k["Close"]))/2
+                    if body_mid<ob_l: continue  # 插針洗盤，非有效支撐
+                    return {"high":ob_h,"low":ob_l,"age":i}
+            else:
+                if not(bar["Close"]>bar["Open"]): continue
+                strong=(next3["Close"].iloc[-1]<bar["Low"] and
+                        (bar["High"]-next3["Close"].iloc[-1])/(bar["High"]+1e-9)>0.005)
+                if not strong: continue
+                ob_h,ob_l=float(bar["High"]),float(bar["Low"])
+                if (after["Close"]>ob_h).any(): continue
+                if ob_l*0.995<=curr_price<=ob_h:
+                    curr_k=df.iloc[-1]
+                    body_mid=(float(curr_k["Open"])+float(curr_k["Close"]))/2
+                    if body_mid>ob_h: continue
+                    return {"high":ob_h,"low":ob_l,"age":i}
+        return None
+
+    def find_fvg(df,mode="bull"):
+        for i in range(2,min(20,len(df)-1)):
+            b1=df.iloc[-i-1]; b3=df.iloc[-i+1]
+            if mode=="bull":
+                if float(b1["High"])<float(b3["Low"]):
+                    top,bot=float(b3["Low"]),float(b1["High"])
+                    if bot<=curr_price<=top:
+                        return {"top":top,"bot":bot,"age":i}
+            else:
+                if float(b1["Low"])>float(b3["High"]):
+                    top,bot=float(b1["Low"]),float(b3["High"])
+                    if bot<=curr_price<=top:
+                        return {"top":top,"bot":bot,"age":i}
+        return None
+
+    bull_ob=find_ob(df15,"bull"); bear_ob=find_ob(df15,"bear")
+    bull_fvg=find_fvg(df15,"bull"); bear_fvg=find_fvg(df15,"bear")
+    sw_high=float(df15["High"].tail(15).iloc[:-2].max())
+    sw_low=float(df15["Low"].tail(15).iloc[:-2].min())
+    bos_b=curr_price>sw_high; bos_r=curr_price<sw_low
+    choch_b=bos_b and bear_str; choch_r=bos_r and bull_str
+
+    crash_note=f"⚠️ {sym} 本日有暴跌預兆，謹慎操作\n" if sym in _crash_warned else ""
+
+    if bull_str and (bull_ob or bull_fvg) and (bos_b or choch_b):
+        bs=sum([bull_str,bool(bull_ob),bool(bull_fvg),bos_b,choch_b]); g=grade(bs,5)
+        if g:
+            mark(cache,ck)
+            stop=(bull_ob["low"] if bull_ob else bull_fvg["bot"])*0.995
+            target=curr_price+(curr_price-stop)*2
+            ctag=" *CHoCH反轉*" if choch_b else " BOS順勢"
+            results.append({"score":bs,"type":"🏦","msg":(
+                f"{tag} 🏦 *[SMC 多頭]{ctag}* `{sym}` {g}\n"
+                f"💰 現價:`{curr_price:.2f}`\n"
+                f"燈號:{L(bull_str)}日線牛市 {L(bool(bull_ob))}OB有效 "
+                f"{L(bool(bull_fvg))}FVG {L(bos_b)}BOS {L(choch_b)}CHoCH\n"
+                +(f"📦 OB:`{bull_ob['low']:.2f}~{bull_ob['high']:.2f}`\n" if bull_ob else "")
+                +(f"🕳️ FVG:`{bull_fvg['bot']:.2f}~{bull_fvg['top']:.2f}`\n" if bull_fvg else "")
+                +f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)\n"
+                +crash_note+f"⏰ {tw_time()} TWN")})
+
+    if bear_str and (bear_ob or bear_fvg) and (bos_r or choch_r):
+        bs=sum([bear_str,bool(bear_ob),bool(bear_fvg),bos_r,choch_r]); g=grade(bs,5)
+        if g:
+            mark(cache,ck)
+            stop=(bear_ob["high"] if bear_ob else bear_fvg["top"])*1.005
+            target=curr_price-(stop-curr_price)*2
+            ctag=" *CHoCH反轉*" if choch_r else " BOS順勢"
+            results.append({"score":bs,"type":"🏦","msg":(
+                f"{tag} 🏦 *[SMC 空頭]{ctag}* `{sym}` {g}\n"
+                f"💰 現價:`{curr_price:.2f}`\n"
+                f"燈號:{L(bear_str)}日線熊市 {L(bool(bear_ob))}OB有效 "
+                f"{L(bool(bear_fvg))}FVG {L(bos_r)}BOS {L(choch_r)}CHoCH\n"
+                +(f"📦 OB:`{bear_ob['low']:.2f}~{bear_ob['high']:.2f}`\n" if bear_ob else "")
+                +(f"🕳️ FVG:`{bear_fvg['bot']:.2f}~{bear_fvg['top']:.2f}`\n" if bear_fvg else "")
+                +f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)\n"
+                +crash_note+f"⏰ {tw_time()} TWN")})
+
     return results if results else None
 
 # 🎯 VCP Pro
@@ -483,13 +577,62 @@ def scan_vcp(ticker_list, cache):
         except Exception as e: print(f"  VCP {sym}: {e}")
     return results
 
+# ══════════════════════════════════════════════════════════════════════════════
 # ₿ 半木夏三背離
+# ══════════════════════════════════════════════════════════════════════════════
 def sig_banmuxa(yf_sym,disp,df15,cache):
     ck=f"bmx_{disp}"
     if not cooled(cache,ck,240) or len(df15)<120: return None
-    # 你原始的半木夏三背離完整邏輯已在此處
-    # ... 請確認已貼入原始程式碼 ...
-    return None   # 替換為你原本的 return results
+    df=add_atr(add_macd(df15.copy()))
+    hist=df["MACD_hist"].values
+    high=df["High"].values; low=df["Low"].values
+    c=df.iloc[-1]; atr=float(c["ATR"]) if not pd.isna(c["ATR"]) else 0
+    price=float(c["Close"])
+
+    def extremes(arr,w=5,mode="peak"):
+        out=[]
+        for i in range(w,len(arr)-w):
+            seg=arr[i-w:i+w+1]
+            if mode=="peak"   and arr[i]==max(seg) and arr[i]>0: out.append(i)
+            if mode=="trough" and arr[i]==min(seg) and arr[i]<0: out.append(i)
+        return out
+
+    peaks=extremes(hist,"peak"); troughs=extremes(hist,"trough")
+    results=[]
+
+    if len(peaks)>=3:
+        p1,p2,p3=peaks[-3],peaks[-2],peaks[-1]
+        if(p3-p1>20 and hist[p1]<hist[p2]<hist[p3] and
+           high[p1]>high[p2]>high[p3] and hist[-1]>0 and
+           abs(hist[-1])<abs(hist[p3])*0.7 and hist[-1]<hist[-2]):
+            stop=float(high[p3])+atr*1.5
+            risk=max(stop-price,atr*0.5)
+            mark(cache,ck)
+            results.append({"score":9,"type":"₿","msg":(
+                f"₿ 🔻 *[半木夏 空頭三背離]* `{disp}` 🏆 S級\n"
+                f"💰 現價:`{price:.2f}`\n"
+                f"📊 MACD三峰:`{hist[p1]:.4f}`→`{hist[p2]:.4f}`→`{hist[p3]:.4f}` ↑ (跨{p3-p1}根)\n"
+                f"📊 K線高點遞降\n"
+                f"🎯 做空:`{price:.2f}` 止損:`{stop:.2f}` 目標:`{price-risk*2:.2f}`\n"
+                f"⏰ {tw_time()} TWN")})
+
+    if len(troughs)>=3:
+        t1,t2,t3=troughs[-3],troughs[-2],troughs[-1]
+        if(t3-t1>20 and hist[t1]>hist[t2]>hist[t3] and
+           low[t1]<low[t2]<low[t3] and hist[-1]<0 and
+           abs(hist[-1])<abs(hist[t3])*0.7 and hist[-1]>hist[-2]):
+            stop=float(low[t3])-atr*1.5
+            risk=max(price-stop,atr*0.5)
+            mark(cache,ck)
+            results.append({"score":9,"type":"₿","msg":(
+                f"₿ 🚀 *[半木夏 多頭三背離]* `{disp}` 🏆 S級\n"
+                f"💰 現價:`{price:.2f}`\n"
+                f"📊 MACD三谷:`{hist[t1]:.4f}`→`{hist[t2]:.4f}`→`{hist[t3]:.4f}` ↓ (跨{t3-t1}根)\n"
+                f"📊 K線低點遞升\n"
+                f"🎯 做多:`{price:.2f}` 止損:`{stop:.2f}` 目標:`{price+risk*2:.2f}`\n"
+                f"⏰ {tw_time()} TWN")})
+
+    return results if results else None
 
 # 彙整報告
 def format_digest(sigs,label):
