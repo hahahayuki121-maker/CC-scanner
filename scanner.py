@@ -1,13 +1,16 @@
-
 """
-CC Market Scanner v8.6
-v8.5基礎 + Gemini優化合併：
-  - 移除Polygon（已退費），改為Alpaca IEX → yfinance雙層
-  - 妖股量比降至1.25x + 突增判斷（適合IEX 2%量能）
-  - fmt_msg加資料來源標籤
-  - validate_breakout妖股放寬（body 0.35，close 0.25）
-  - Alpaca加延遲檢查（>15分鐘視為無效）
-  - _crash_warned移至頂層定義
+CC Market Scanner v9.5 — 總指揮官整合版
+底本：v9.0（完整信號）
+整合自：v10.2（風控/報表/倉位管理）
+
+主要改進（相對v9.0）：
+1. 風控核心升級：analyze_portfolio() 追蹤動態開倉數/總風險/連敗保護
+2. calc_position() 傳入 pf 狀態，杜絕超倉（總持倉≤5，總風險≤2%）
+3. AI 族群無上限（移除人為限制）
+4. 報表全掛：日報(收盤後)、週報(週六09:00)、月報(每月首週六)
+5. log_forward_test 補記 shares 欄位
+6. 修正 v9 已知 Bug：get_tw_stable 拼寫錯誤、_bt_stats_cache 全局聲明
+7. 保留 v9 所有策略：SMC/VCP/半木夏/盤前跳空/WASHOUT/PULLBACK/SURGE/CRASH
 """
 
 import requests
@@ -19,20 +22,21 @@ import os
 import json
 from datetime import datetime, timedelta
 import pytz
+from dataclasses import dataclass, asdict
 
-# ── Token ─────────────────────────────────────────────────────────────────────
+# ── Token ──────────────────────────────────────────────────────────────────────
 TG_TOKEN      = os.environ.get("TG_TOKEN",      "")
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID",    "")
-# Polygon已退費移除
 ALPACA_KEY    = os.environ.get("ALPACA_KEY",    "")
 ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
+FMP_KEY       = os.environ.get("FMP_API_KEY",   "")
 ALPACA_BASE   = "https://data.alpaca.markets/v2"
-_crash_warned = set()   # 頂層定義，避免信號函數載入時報錯
+ACCOUNT_BAL   = int(os.environ.get("ACCOUNT_BAL", "25000"))
 
-# ── 監控名單（移除中概，新增指定標的）────────────────────────────────────────
+# ── 監控名單 ───────────────────────────────────────────────────────────────────
 TICKERS = {
     "🇺🇸": ["NVDA","AVGO","ANET","VRT","VST","TSLA","AMD","AMZN",
-             "AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB","QQQ","ASX","INTC"],
+             "AAPL","META","MSFT","GOOGL","PLTR","CRDO","ALAB","QQQ","INTC"],
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
     "🚀": ["CRCL","COIN","MSTR","MARA","CLSK","HOOD","SOFI",
@@ -41,24 +45,39 @@ TICKERS = {
     "🇹🇼": ["2330.TW","00631L.TW"],
     "₿":   [("BTC-USD","BTC/USDT"),("ETH-BTC","ETH/BTC")],
 }
-VOLATILE_TAGS = {"🚀","⚛️"}
+VOLATILE_TAGS = {"🚀", "⚛️"}
 
-# ── VCP 手動候選清單 ──────────────────────────────────────────────────────────
 VCP_WATCHLIST = ["LUNR","ETON","MCS","REPX","TALK"]
-_extra = os.environ.get("EXTRA_VCP","")
+_extra = os.environ.get("EXTRA_VCP", "")
 if _extra:
     VCP_WATCHLIST += [s.strip() for s in _extra.split(",") if s.strip()]
 
-# ── 持倉提示 ──────────────────────────────────────────────────────────────────
 PORTFOLIO_HINTS = {
-    "NVDA": "💼 持倉 → PULLBACK/OB可賣Covered Call，行權價現價+5%，2~4週到期",
-    "NVTS": "💼 持倉 → 妖股屬性，量確認再進，留意假突破",
+    "NVDA": "💼 持倉 → PULLBACK/OB可賣Covered Call，行權價現價+5%",
+    "NVTS": "💼 持倉 → 妖股屬性，量確認再進",
     "AVGO": "💼 定投股 → 強信號可考慮加碼",
     "VRT":  "💼 定投股 → 強信號可考慮加碼",
-    "ANET": "💼 定投股 → 強信號可考慮加碼",
-    "AXTI": "⚠️ 薄流動性，信號確認後小倉進，止損嚴格",
-    "ONDS": "⚠️ 薄流動性，賣不掉風險，只做盤前跳空信號",
+    "AXTI": "⚠️ 薄流動性，信號確認後小倉，止損嚴格",
+    "ONDS": "⚠️ 薄流動性，只做盤前跳空信號",
 }
+
+# ── 風控設定（v10.2升級版）────────────────────────────────────────────────────
+RISK_BUDGET = {
+    "SURGE":   0.005,
+    "WASHOUT": 0.005,
+    "VCP":     0.0075,
+    "CRASH":   0.005,
+    "CRYPTO":  0.004,
+    "DEFAULT": 0.005,
+}
+STRATEGY_WEIGHT = {
+    "SURGE": 1.0, "WASHOUT": 0.7, "VCP": 1.2,
+    "CRYPTO": 0.5, "DEFAULT": 1.0,
+}
+MAX_TOTAL_RISK     = 0.02   # 總風險上限 2%
+MAX_OPEN_POSITIONS = 5      # 總持倉上限
+# AI族群作標記用，不設上限（移除v9人為限制）
+AI_GROUP = {"NVDA","AMD","AVGO","ANET","MSFT","GOOGL","META"}
 
 # ── 假日清單 ──────────────────────────────────────────────────────────────────
 US_HOLIDAYS = {
@@ -75,8 +94,9 @@ TW_HOLIDAYS = {
     "2026-06-19","2026-09-26","2026-10-09","2026-10-10",
 }
 
-# ── 冷卻（檔案儲存，跨執行有效）──────────────────────────────────────────────
-CACHE_FILE = "/tmp/cc_cache.json"
+# ── 冷卻快取 ──────────────────────────────────────────────────────────────────
+CACHE_FILE    = "/tmp/cc_cache.json"
+FWD_TEST_FILE = "/tmp/cc_forward_log.json"
 
 def load_cache():
     try:
@@ -85,15 +105,170 @@ def load_cache():
 
 def save_cache(c):
     try:
-        with open(CACHE_FILE,"w") as f: json.dump(c, f)
+        with open(CACHE_FILE, "w") as f: json.dump(c, f)
     except: pass
 
 def cooled(cache, key, mins=30):
     if key not in cache: return True
-    return (datetime.utcnow()-datetime.fromisoformat(cache[key])).total_seconds()>mins*60
+    return (datetime.utcnow() - datetime.fromisoformat(cache[key])).total_seconds() > mins * 60
 
 def mark(cache, key):
     cache[key] = datetime.utcnow().isoformat()
+
+# ── 全域狀態 ──────────────────────────────────────────────────────────────────
+_crash_warned    = set()
+_trend_cache     = {}
+_bt_stats_cache  = {}   # 週末回測快取（全局，必須在模組層聲明）
+_market_regime_cache = {"ts": None, "risk_on": True}
+
+# ── Forward Test ──────────────────────────────────────────────────────────────
+@dataclass
+class StrategyStats:
+    strategy: str
+    sample_size: int
+    wins: int
+    losses: int
+    winrate: float
+    avg_win_r: float
+    avg_loss_r: float
+    expectancy_r: float
+
+    def is_tradeable(self, min_samples=15, min_exp=0.10):
+        return self.sample_size >= min_samples and self.expectancy_r >= min_exp
+
+def load_fwd():
+    try:
+        with open(FWD_TEST_FILE) as f: return json.load(f)
+    except: return []
+
+def save_fwd(data):
+    try:
+        with open(FWD_TEST_FILE, "w") as f: json.dump(data[-500:], f)
+    except: pass
+
+def log_forward_test(sym, strategy, entry, stop, target, shares=0):
+    """新增 shares 欄位（v10.2整合）"""
+    data = load_fwd()
+    sig_id = f"{sym}_{strategy}_{datetime.utcnow().strftime('%Y%m%d_%H%M')}"
+    if any(x.get("signal_id") == sig_id for x in data): return
+    data.append({
+        "signal_id": sig_id, "sym": sym, "strategy": strategy,
+        "shares": shares,
+        "entry": round(entry, 4), "stop": round(stop, 4), "target": round(target, 4),
+        "opened_at": _tw().strftime("%Y-%m-%d %H:%M"),
+        "status": "OPEN", "exit": None, "r_multiple": None,
+    })
+    save_fwd(data)
+
+def settle_forward_tests():
+    """結算 OPEN 中的 forward test（5日無死角版）"""
+    data = load_fwd(); changed = False
+    for row in data:
+        if row.get("status") != "OPEN": continue
+        sym = row["sym"]
+        try:
+            df = _clean(yf.download(sym, interval="5m", period="5d", progress=False, auto_adjust=True))
+            if df.empty: continue
+            px    = float(df["Close"].iloc[-1])
+            entry = float(row["entry"]); stop = float(row["stop"]); target = float(row["target"])
+            risk  = entry - stop
+            if risk <= 0: continue
+            if px <= stop:
+                row.update({"status": "STOPPED", "exit": round(px,4), "r_multiple": -1.0})
+                changed = True
+            elif px >= target:
+                row.update({"status": "TARGET_HIT", "exit": round(px,4), "r_multiple": round((target-entry)/risk, 2)})
+                changed = True
+        except: pass
+    if changed: save_fwd(data)
+
+def build_strategy_stats(fwd_data=None):
+    data = fwd_data if fwd_data is not None else load_fwd()
+    grouped = {}
+    for row in data:
+        s = row.get("strategy", "DEFAULT")
+        grouped.setdefault(s, []).append(row)
+    stats = {}
+    for strategy, rows in grouped.items():
+        closed = [r for r in rows if r.get("r_multiple") is not None]
+        if not closed: continue
+        wins   = [r for r in closed if r["r_multiple"] > 0]
+        losses = [r for r in closed if r["r_multiple"] <= 0]
+        n = len(closed)
+        stats[strategy] = StrategyStats(
+            strategy=strategy, sample_size=n,
+            wins=len(wins), losses=len(losses),
+            winrate=len(wins)/n,
+            avg_win_r=sum(r["r_multiple"] for r in wins)/max(len(wins),1),
+            avg_loss_r=sum(r["r_multiple"] for r in losses)/max(len(losses),1),
+            expectancy_r=sum(r["r_multiple"] for r in closed)/n,
+        )
+    return stats
+
+# ── 投資組合狀態分析（v10.2 核心）────────────────────────────────────────────
+def analyze_portfolio(fwd_data=None):
+    """追蹤動態開倉數、總風險、近5筆R值（連敗保護用）"""
+    data = fwd_data if fwd_data is not None else load_fwd()
+    open_pos   = [r for r in data if r.get("status") == "OPEN"]
+    closed_pos = [r for r in data if r.get("r_multiple") is not None]
+    total_risk_dollar = sum(
+        abs(float(r.get("entry",0)) - float(r.get("stop",0))) * int(r.get("shares", 0))
+        for r in open_pos
+    )
+    recent_r = sum(r["r_multiple"] for r in closed_pos[-5:]) if len(closed_pos) >= 5 else 0
+    return {
+        "open_count":  len(open_pos),
+        "total_risk":  total_risk_dollar,
+        "recent_r":    recent_r,
+    }
+
+# ── 倉位計算（v10.2 升級，傳入 pf 狀態）──────────────────────────────────────
+def calc_position(entry, stop, strategy="DEFAULT", stats=None, pf=None):
+    """
+    v9.5 整合版：
+    - 硬限制：總持倉 ≤ MAX_OPEN_POSITIONS，總風險 ≤ MAX_TOTAL_RISK
+    - 軟調整：forward test 統計 / 週末回測 / 連敗降倉
+    - AI族群不再設上限
+    """
+    risk_per_share = abs(entry - stop)
+    if risk_per_share <= 0: return 0
+
+    # 硬性風控（來自 v10.2）
+    if pf is not None:
+        if pf["open_count"] >= MAX_OPEN_POSITIONS: return 0
+        max_total_risk_dollar = ACCOUNT_BAL * MAX_TOTAL_RISK
+        if pf["total_risk"] >= max_total_risk_dollar: return 0
+
+    risk_pct = RISK_BUDGET.get(strategy, RISK_BUDGET["DEFAULT"]) * STRATEGY_WEIGHT.get(strategy, 1.0)
+
+    # forward test 微調（≥20筆真實記錄）
+    if stats and stats.sample_size >= 20:
+        if stats.expectancy_r >= 0.4 and stats.winrate >= 0.55:
+            risk_pct = min(risk_pct * 1.25, 0.01)
+        elif stats.expectancy_r < 0.0:
+            risk_pct = max(risk_pct * 0.5, 0.002)
+    # 週末回測備選（forward不夠時）
+    elif _bt_stats_cache.get(strategy, {}).get("n", 0) >= 30:
+        bt = _bt_stats_cache[strategy]
+        if bt["wr"] >= 0.55 and bt["exp"] >= 0.3:
+            risk_pct = min(risk_pct * 1.15, 0.008)
+        elif bt["exp"] < 0.0:
+            risk_pct = max(risk_pct * 0.6, 0.002)
+
+    # 連敗保護（v10.2）
+    if pf is not None and pf.get("recent_r", 0) <= -3:
+        risk_pct *= 0.5
+
+    # 計算股數，確保不超過總風險剩餘額度
+    if pf is not None:
+        remaining_risk = ACCOUNT_BAL * MAX_TOTAL_RISK - pf["total_risk"]
+        actual_budget  = min(ACCOUNT_BAL * risk_pct, max(remaining_risk, 0))
+    else:
+        actual_budget  = ACCOUNT_BAL * risk_pct
+
+    shares = int(actual_budget / risk_per_share)
+    max_affordable = int(ACCOUNT_BAL / entry) if entry > 0 else 0
+    return min(shares, max_affordable)
 
 # ── 時間判斷 ──────────────────────────────────────────────────────────────────
 def _ny(): return datetime.now(pytz.timezone("America/New_York"))
@@ -101,811 +276,1121 @@ def _tw(): return datetime.now(pytz.timezone("Asia/Taipei"))
 def tw_time(): return _tw().strftime("%H:%M:%S")
 
 def us_status():
-    ny=_ny(); d=ny.strftime("%Y-%m-%d")
-    if ny.weekday()>=5 or d in US_HOLIDAYS: return "CLOSED"
-    m=ny.hour*60+ny.minute
-    if 240<=m<570: return "PRE"
-    if 570<=m<930: return "OPEN"
-    if 930<=m<1200: return "POST"
+    ny = _ny(); d = ny.strftime("%Y-%m-%d")
+    if ny.weekday() >= 5 or d in US_HOLIDAYS: return "CLOSED"
+    m = ny.hour*60 + ny.minute
+    if 240 <= m < 570:  return "PRE"
+    if 570 <= m < 930:  return "OPEN"
+    if 930 <= m < 1200: return "POST"
     return "CLOSED"
 
 def is_tw_open():
-    tw=_tw(); d=tw.strftime("%Y-%m-%d")
-    if tw.weekday()>=5 or d in TW_HOLIDAYS: return False
-    return 540<=tw.hour*60+tw.minute<810
+    tw = _tw(); d = tw.strftime("%Y-%m-%d")
+    if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
+    return 540 <= tw.hour*60 + tw.minute < 810
 
 def is_tw_swing():
-    tw=_tw(); d=tw.strftime("%Y-%m-%d")
-    if tw.weekday()>=5 or d in TW_HOLIDAYS: return False
-    return 780<=tw.hour*60+tw.minute<810
+    tw = _tw(); d = tw.strftime("%Y-%m-%d")
+    if tw.weekday() >= 5 or d in TW_HOLIDAYS: return False
+    return 780 <= tw.hour*60 + tw.minute < 810
 
 def is_us_swing():
-    ny=_ny(); d=ny.strftime("%Y-%m-%d")
-    if ny.weekday()>=5 or d in US_HOLIDAYS: return False
-    return 900<=ny.hour*60+ny.minute<930
+    ny = _ny(); d = ny.strftime("%Y-%m-%d")
+    if ny.weekday() >= 5 or d in US_HOLIDAYS: return False
+    return 900 <= ny.hour*60 + ny.minute < 930
 
 def get_mode():
-    tw=_tw(); m=tw.hour*60+tw.minute; st=us_status()
-    if 1275<=m<1290: return "DIGEST_PRE"   # 21:15-21:30 TWN
-    if 480<=m<540:   return "DIGEST_TW"    # 08:00-09:00 TWN
+    tw = _tw(); m = tw.hour*60 + tw.minute; st = us_status()
+    if 1275 <= m < 1290: return "DIGEST_PRE"
+    if 480 <= m < 540:   return "DIGEST_TW"
     if st in ("PRE","OPEN") or is_tw_open(): return "OPEN_MODE"
     return "SILENT"
 
-def is_digest_30_window():
-    return _tw().minute%30<=4
+def is_digest_30_window(): return _tw().minute % 30 <= 4
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID: print(msg); return False
     try:
-        r=requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id":TG_CHAT_ID,"text":msg,"parse_mode":"Markdown"},timeout=10)
-        return r.json().get("ok",False)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        return r.json().get("ok", False)
     except: return False
 
 def L(v): return "✅" if v else "❌"
 
 def grade(score, total):
-    p=score/total
-    if p>=0.85: return "🏆 S級"
-    if p>=0.70: return "🥇 A級"
+    p = score / total
+    if p >= 0.85: return "🏆 S級"
+    if p >= 0.70: return "🥇 A級"
     return None
 
-def fmt_msg(tag,emoji,signal,sym,g,price,chg,vr,rsi,smc,lbl,advice,lights="",extra="",source=""):
-    trend="📈" if chg>=0 else "📉"
-    src=f" · 來源:`{'IEX即時' if source=='alpaca' else 'yf延遲'}`" if source else ""
-    lines=[f"{tag} {emoji} *[{signal}]* `{sym}` {g}{src}",
-           f"💰 現價:`{price:.2f}` · {trend}:`{chg:+.1f}%`",
-           f"📊 量比:`{vr:.1f}x` · RSI:`{rsi:.0f}` · SMC:`{smc}`"]
+def fmt_msg(tag, emoji, signal, sym, g, price, chg, vr, rsi, smc, lbl, advice,
+            lights="", extra="", source="", shares=0, stop=0, earn_warn=""):
+    trend = "📈" if chg >= 0 else "📉"
+    src = f" · 來源:`{'IEX即時' if source=='alpaca' else 'yf延遲'}`" if source else ""
+    strat_key = signal.split()[0] if signal else "DEFAULT"
+    lines = [
+        f"{tag} {emoji} *[{signal}]* `{sym}` {g}{src}{earn_warn}",
+        f"💰 現價:`{price:.2f}` · {trend}:`{chg:+.1f}%`",
+        f"📊 量比:`{vr:.1f}x` · RSI:`{rsi:.0f}` · SMC:`{smc}`"
+    ]
     if lights: lines.append(f"燈號: {lights}")
     if extra:  lines.append(extra)
-    hint=PORTFOLIO_HINTS.get(sym,"")
+    if shares > 0:
+        lines.append(
+            f"🛡️ 建議倉位:`{shares}`股 · 止損:`{stop:.2f}` "
+            f"(固定{RISK_BUDGET.get(strat_key, RISK_BUDGET['DEFAULT'])*100:.1f}%風險)"
+        )
+    hint = PORTFOLIO_HINTS.get(sym, "")
     if hint: lines.append(f"📌 {hint}")
-    lines+=[f"🎫 *[{lbl}]*: {advice}",f"⏰ {tw_time()} TWN"]
+    lines += [f"🎫 *[{lbl}]*: {advice}", f"⏰ {tw_time()} TWN"]
     return "\n".join(lines)
 
-# ── 趨勢模板（AXTI修正：妖股直接通過，避免被過濾）──────────────────────────
-_trend_cache={}
-
-def passes_trend(sym, tag, df1d=None):
-    """
-    妖股直接通過，龍頭核心股直接通過，其餘跑趨勢模板
-    """
-    if tag in VOLATILE_TAGS: return True  # 妖股直接通過
-    CORE_BYPASS = {"NVDA","AVGO","TSLA","VRT","ANET","AMD","AAPL","META",
-                   "MSFT","GOOGL","AMZN","QQQ","PLTR","CRDO","ALAB"}
-    if sym in CORE_BYPASS: return True   # 龍頭核心股直接通過
-    if sym in _trend_cache: return _trend_cache[sym]
+# ── 大盤濾網 QQQ 10MA ─────────────────────────────────────────────────────────
+def get_market_regime(cache=None):
+    """QQQ 10MA 濾網：跌破時一般股封印，只放行妖股"""
+    now = datetime.utcnow()
+    if (_market_regime_cache["ts"] and
+            (now - _market_regime_cache["ts"]).total_seconds() < 300):
+        return _market_regime_cache["risk_on"]
     try:
-        if df1d is None or len(df1d)<50:
-            _trend_cache[sym]=True; return True
-        c=df1d["Close"]; n=len(c)
-        price=float(c.iloc[-1])
-        ma50=float(c.rolling(50).mean().iloc[-1])
-        if n<152:
-            res=price>ma50 and ma50>float(c.rolling(50).mean().iloc[-6])
-        elif n<252:
-            ma150=float(c.rolling(150).mean().iloc[-1])
-            res=price>ma50>ma150
-        else:
-            ma150=float(c.rolling(150).mean().iloc[-1])
-            ma200=float(c.rolling(200).mean().iloc[-1])
-            ma200_old=float(c.rolling(200).mean().iloc[-22])
-            yr_low=float(c.tail(252).min())
-            yr_high=float(c.tail(252).max())
-            res=sum([price>ma50,ma50>ma150,ma150>ma200,
-                     ma200>ma200_old,price>=yr_low*1.25,
-                     price>=yr_high*0.75])>=5
-        _trend_cache[sym]=res; return res
+        df = _clean(yf.download("QQQ", period="1mo", interval="1d", progress=False, auto_adjust=True))
+        if df.empty or len(df) < 10:
+            _market_regime_cache.update({"ts": now, "risk_on": True}); return True
+        c   = float(df["Close"].iloc[-1])
+        ma10 = float(df["Close"].rolling(10).mean().iloc[-1])
+        risk_on = c > ma10
+        _market_regime_cache.update({"ts": now, "risk_on": risk_on})
+        return risk_on
     except:
-        _trend_cache[sym]=True; return True
+        _market_regime_cache.update({"ts": now, "risk_on": True}); return True
 
-# ── 數據獲取（AXTI修正：Polygon→Alpaca→yfinance三層）────────────────────────
+# ── 財報警告 ──────────────────────────────────────────────────────────────────
+def get_earn_warn(sym, cache):
+    """7天內財報標記，FMP優先，fallback yfinance，24h快取"""
+    ek    = f"earn_{sym}"
+    ek_ts = f"earn_ts_{sym}"
+    now   = _ny().replace(tzinfo=None)
+
+    # 24h 快取命中
+    if ek_ts in cache:
+        try:
+            if (datetime.utcnow() - datetime.fromisoformat(cache[ek_ts])).total_seconds() < 86400:
+                v = cache.get(ek, "NONE")
+                if v == "NONE": return ""
+                try:
+                    days = (datetime.fromisoformat(v) - now).days
+                    return f" ⚠️{days}天後財報" if 0 <= days <= 7 else ""
+                except: return ""
+        except: pass
+
+    if ek in cache:
+        v = cache[ek]
+        if v == "NONE": return ""
+        try:
+            days = (datetime.fromisoformat(v) - now).days
+            if 0 <= days <= 7: return f" ⚠️{days}天後財報"
+            if days < 0: del cache[ek]
+            else: return ""
+        except: pass
+
+    earn_date = None
+
+    # FMP（免費版每天250次）
+    if FMP_KEY:
+        try:
+            r = requests.get(
+                "https://financialmodelingprep.com/api/v3/earning_calendar",
+                params={"from": now.strftime("%Y-%m-%d"),
+                        "to": (now + timedelta(days=14)).strftime("%Y-%m-%d"),
+                        "apikey": FMP_KEY},
+                timeout=8
+            )
+            for item in r.json():
+                if item.get("symbol") == sym and item.get("date"):
+                    earn_date = datetime.strptime(item["date"][:10], "%Y-%m-%d")
+                    break
+        except: pass
+
+    # yfinance fallback
+    if not earn_date:
+        try:
+            tk = yf.Ticker(sym); ed = tk.earnings_dates
+            if ed is not None and not ed.empty:
+                future = ed[ed.index.tz_localize(None) > now]
+                if not future.empty:
+                    earn_date = future.index[0].tz_localize(None)
+        except: pass
+
+    if earn_date:
+        cache[ek]    = earn_date.isoformat()
+        days = (earn_date - now).days
+        if 0 <= days <= 7: return f" ⚠️{days}天後財報"
+        return ""
+    cache[ek]    = "NONE"
+    cache[ek_ts] = datetime.utcnow().isoformat()
+    return ""
+
+# ── 數據獲取 ──────────────────────────────────────────────────────────────────
 def _clean(df):
-    if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     return df.dropna()
 
-# get_poly 已移除（Polygon退費）
-
-def get_alpaca(sym,tf="5Min",limit=80):
+def get_alpaca(sym, tf="5Min", limit=80):
     if not ALPACA_KEY: return pd.DataFrame()
     try:
-        r=requests.get(f"{ALPACA_BASE}/stocks/{sym}/bars",
-            headers={"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET},
-            params={"timeframe":tf,"limit":limit,"feed":"iex"},timeout=10)
-        bars=r.json().get("bars",[])
+        r = requests.get(
+            f"{ALPACA_BASE}/stocks/{sym}/bars",
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            params={"timeframe": tf, "limit": limit, "feed": "iex"},
+            timeout=10
+        )
+        bars = r.json().get("bars", [])
         if not bars: return pd.DataFrame()
-        df=pd.DataFrame(bars)
-        df["t"]=pd.to_datetime(df["t"])
-        df=df.set_index("t").rename(
-            columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"])
+        df = df.set_index("t").rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
         try:
-            if (_ny()-df.index[-1].tz_convert("America/New_York")).total_seconds()>900:
+            if (_ny() - df.index[-1].tz_convert("America/New_York")).total_seconds() > 900:
                 return pd.DataFrame()
         except: pass
         return df[["Open","High","Low","Close","Volume"]].dropna()
     except: return pd.DataFrame()
 
-REQ_LEN = 80  # 強制統一資料長度，解決df5/df15長度不對齊漏洞
+REQ_LEN = 80
+
+def get_vr_adj(c_vol, vma_short, df1d=None):
+    """
+    Gemini v13.0 精確版：防低量時段假爆量
+    78根 = 美股9:30-16:00共78根5分鐘K線；IEX約佔全市場2.5%
+    """
+    if df1d is None or len(df1d) < 5:
+        return c_vol / (vma_short + 1)
+    daily_avg    = float(df1d["Volume"].tail(5).mean())
+    iex_baseline = (daily_avg / 78) * 0.025
+    safe_denom   = max(vma_short + 1, iex_baseline)
+    return c_vol / safe_denom
 
 def get_consistent(sym):
-    """Alpaca IEX(即時) → yfinance(延遲)，Polygon已退費移除
-    強制 df5 長度 >= REQ_LEN，消滅資料長度不對齊問題
-    """
-    df5=get_alpaca(sym,"5Min",REQ_LEN)
+    """Alpaca量能修正版：IEX取即時價格，yfinance日線取量能基準"""
+    df5 = get_alpaca(sym, "5Min", REQ_LEN)
     if not df5.empty:
-        # 延遲檢查：最後一根距現在超過15分鐘視為無效
         try:
-            last_t=df5.index[-1]
-            if hasattr(last_t,'tz_convert'):
-                last_t=last_t.tz_convert("America/New_York")
-            if (_ny().replace(tzinfo=None)-last_t.replace(tzinfo=None)).total_seconds()>900:
-                print(f"  ⚠️ {sym} Alpaca延遲，切換yfinance")
-                df5=pd.DataFrame()
+            if (_ny().replace(tzinfo=None) -
+                    df5.index[-1].tz_convert("America/New_York").replace(tzinfo=None)
+               ).total_seconds() > 900:
+                df5 = pd.DataFrame()
         except: pass
+
     if not df5.empty:
-        df15=get_alpaca(sym,"15Min",REQ_LEN//2)
+        df15 = get_alpaca(sym, "15Min", REQ_LEN // 2)
         if not df15.empty:
-            # 強制對齊長度（取最後 REQ_LEN 根）
+            try:
+                df1d_vol = _clean(yf.download(sym, interval="1d", period="10d",
+                                              progress=False, auto_adjust=True))
+                if not df1d_vol.empty:
+                    df5["_VMA15"] = df5["Volume"].rolling(15).mean()
+                    df5["VR_Adj"] = df5.apply(
+                        lambda row: get_vr_adj(
+                            row["Volume"],
+                            row["_VMA15"] if not pd.isna(row["_VMA15"]) else 0,
+                            df1d_vol),
+                        axis=1
+                    )
+                    df5.drop(columns=["_VMA15"], inplace=True, errors="ignore")
+            except: pass
             return df5.iloc[-REQ_LEN:], df15.iloc[-REQ_LEN//2:], "alpaca"
-    df5 =_clean(yf.download(sym,interval="5m", period="2d",progress=False,auto_adjust=True))
-    df15=_clean(yf.download(sym,interval="15m",period="5d",progress=False,auto_adjust=True))
+
+    df5  = _clean(yf.download(sym, interval="5m",  period="2d", progress=False, auto_adjust=True))
+    df15 = _clean(yf.download(sym, interval="15m", period="5d", progress=False, auto_adjust=True))
     if not df5.empty:
         df5  = df5.iloc[-REQ_LEN:]
         df15 = df15.iloc[-REQ_LEN//2:]
-    return df5,df15,"yfinance"
+    return df5, df15, "yfinance"
 
 def get_tw_stable(sym):
-    """doc2台股穩定性：5m→15m→1h三層fallback"""
-    df=_clean(yf.download(sym,interval="5m",period="2d",progress=False,auto_adjust=True))
-    if not df.empty and len(df)>=5: return df
-    df=_clean(yf.download(sym,interval="15m",period="5d",progress=False,auto_adjust=True))
-    if not df.empty: return df
-    return _clean(yf.download(sym,interval="1h",period="5d",progress=False,auto_adjust=True))
+    """修正 v9 拼寫錯誤（*clean → _clean）"""
+    for iv, pd_ in [("5m","2d"),("15m","5d"),("1h","5d")]:
+        df = _clean(yf.download(sym, interval=iv, period=pd_, progress=False, auto_adjust=True))
+        if not df.empty and len(df) >= 5: return df
+    return pd.DataFrame()
 
-def get_yf(sym,interval,period):
-    return _clean(yf.download(sym,interval=interval,period=period,
-                               progress=False,auto_adjust=True))
+def get_yf(sym, interval, period):
+    return _clean(yf.download(sym, interval=interval, period=period,
+                              progress=False, auto_adjust=True))
 
 # ── 指標 ──────────────────────────────────────────────────────────────────────
-def add_rsi(df,n=14):
-    df=df.copy(); df["RSI"]=ta.momentum.RSIIndicator(df["Close"],window=n).rsi(); return df
-def add_sma(df,col,n,out):
-    df=df.copy(); df[out]=ta.trend.SMAIndicator(df[col],window=n).sma_indicator(); return df
+def add_rsi(df, n=14):
+    df = df.copy(); df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=n).rsi(); return df
+
+def add_sma(df, col, n, out):
+    df = df.copy(); df[out] = ta.trend.SMAIndicator(df[col], window=n).sma_indicator(); return df
+
 def add_macd(df):
-    df=df.copy(); m=ta.trend.MACD(df["Close"])
-    df["MACD"]=m.macd(); df["MACD_sig"]=m.macd_signal(); df["MACD_hist"]=m.macd_diff(); return df
-def add_atr(df,n=14):
-    df=df.copy()
-    df["ATR"]=ta.volatility.AverageTrueRange(df["High"],df["Low"],df["Close"],window=n).average_true_range()
+    df = df.copy(); m = ta.trend.MACD(df["Close"])
+    df["MACD"] = m.macd(); df["MACD_sig"] = m.macd_signal()
+    df["MACD_hist"] = m.macd_diff(); return df
+
+def add_atr(df, n=14):
+    df = df.copy()
+    df["ATR"] = ta.volatility.AverageTrueRange(
+        df["High"], df["Low"], df["Close"], window=n).average_true_range()
     return df
 
 def get_day_open(df):
-    ny_today=_ny().date()
-    try: idx=df.index.tz_convert("America/New_York")
-    except: idx=df.index
-    mask=[t.date()==ny_today for t in idx]
-    today=df[mask]
+    ny_today = _ny().date()
+    try: idx = df.index.tz_convert("America/New_York")
+    except: idx = df.index
+    mask = [t.date() == ny_today for t in idx]
+    today = df[mask]
     return today.iloc[0]["Open"] if not today.empty else None
 
-def dynamic_stop(df,day_low,tag):
-    if any(t in tag for t in VOLATILE_TAGS) and len(df)>=14:
-        atr=ta.volatility.AverageTrueRange(
-            df["High"],df["Low"],df["Close"],window=14).average_true_range().iloc[-1]
-        return day_low-atr*1.5,f"ATR×1.5(`{atr:.2f}`)"
-    return day_low*0.995,"低點×0.995"
+def dynamic_stop(df, day_low, tag):
+    if any(t in tag for t in VOLATILE_TAGS) and len(df) >= 14:
+        atr = ta.volatility.AverageTrueRange(
+            df["High"], df["Low"], df["Close"], window=14).average_true_range().iloc[-1]
+        return day_low - atr * 1.5, f"ATR×1.5(`{atr:.2f}`)"
+    return day_low * 0.995, "低點×0.995"
 
 def detect_smc(df15):
-    if len(df15)<15: return "無結構"
-    c=df15.iloc[-1]; p=df15.iloc[-2]
-    hi=df15["High"].tail(10).max(); lo=df15["Low"].tail(10).min()
-    if c["Close"]>hi and p["Close"]<=hi: return "BOS多🔥"
-    if c["Close"]<lo and p["Close"]>=lo: return "BOS空🔴"
-    if c["Close"]>df15["High"].tail(5).iloc[:-1].max(): return "CHoCH轉多"
-    if c["Close"]<df15["Low"].tail(5).iloc[:-1].min():  return "CHoCH轉空"
+    if len(df15) < 15: return "無結構"
+    c = df15.iloc[-1]; p = df15.iloc[-2]
+    hi = df15["High"].tail(10).max(); lo = df15["Low"].tail(10).min()
+    if c["Close"] > hi and p["Close"] <= hi: return "BOS多🔥"
+    if c["Close"] < lo and p["Close"] >= lo: return "BOS空🔴"
+    if c["Close"] > df15["High"].tail(5).iloc[:-1].max(): return "CHoCH轉多"
+    if c["Close"] < df15["Low"].tail(5).iloc[:-1].min():  return "CHoCH轉空"
     return "盤整"
 
-# ── 假突破校驗（折衷版：妖股放寬）──────────────────────────────────────────
 def validate_breakout(df, tag):
-    """
-    Gemini合併版：妖股body 0.35 / close 0.25，更寬鬆
-    額外突增可繞過量能門檻
-    """
-    if len(df)<10: return True, ""
-    c=df.iloc[-1]; p=df.iloc[-2]
-    is_rocket=any(t in VOLATILE_TAGS for t in [tag] if t)
-
-    vma10=df["Volume"].iloc[-11:-1].mean() if len(df)>11 else 1
-    vol_thresh=1.25 if is_rocket else 2.0
-    vol_ok=c["Volume"]>vma10*vol_thresh
-
-    # 妖股額外突增判斷（Gemini新增）
-    if is_rocket and len(df)>=15:
-        recent_vol=df["Volume"].tail(5).mean()
-        older_vol=df["Volume"].iloc[-15:-5].mean() or 1
-        if recent_vol>older_vol*2.0:
-            vol_ok=True  # 突增可繞過門檻
-
-    rng=c["High"]-c["Low"]
-    body=abs(c["Close"]-c["Open"])
-    body_thresh=0.35 if is_rocket else 0.5  # Gemini: 妖股0.35
-    body_ok=(body/rng>=body_thresh) if rng>0 else True
-    close_thresh=0.25 if is_rocket else 0.20  # Gemini: 妖股收盤位寬鬆
-    close_ok=((c["High"]-c["Close"])/rng<=close_thresh) if rng>0 else True
-
-    reasons=[]
-    if not vol_ok:  reasons.append(f"量能不足{c['Volume']/vma10:.1f}x")
-    if not body_ok: reasons.append(f"實體{body/rng:.0%}<{body_thresh:.0%}")
+    if len(df) < 10: return True, ""
+    c = df.iloc[-1]
+    is_rocket = any(t in VOLATILE_TAGS for t in [tag] if t)
+    if "VR_Adj" in df.columns:
+        vr_adj  = float(df["VR_Adj"].iloc[-1])
+        vol_ok  = vr_adj > (0.8 if is_rocket else 1.5)
+    else:
+        vma10     = df["Volume"].iloc[-11:-1].mean() if len(df) > 11 else 1
+        vol_thresh = 1.25 if is_rocket else 2.0
+        vol_ok    = c["Volume"] > vma10 * vol_thresh
+    if is_rocket and len(df) >= 15:
+        recent_vol = df["Volume"].tail(5).mean()
+        older_vol  = df["Volume"].iloc[-15:-5].mean() or 1
+        if recent_vol > older_vol * 2.0: vol_ok = True
+    rng    = c["High"] - c["Low"]; body = abs(c["Close"] - c["Open"])
+    body_ok  = (body / rng >= (0.35 if is_rocket else 0.5)) if rng > 0 else True
+    close_ok = ((c["High"] - c["Close"]) / rng <= (0.25 if is_rocket else 0.20)) if rng > 0 else True
+    reasons = []
+    if not vol_ok:   reasons.append("量能不足")
+    if not body_ok:  reasons.append("實體過小")
     if not close_ok: reasons.append("收盤受阻")
-    return len(reasons)==0, " · ".join(reasons)
+    return len(reasons) == 0, " · ".join(reasons)
+
+def passes_trend(sym, tag, df1d=None):
+    if tag in VOLATILE_TAGS: return True
+    CORE_BYPASS = {"NVDA","AVGO","TSLA","VRT","ANET","AMD","AAPL","META",
+                   "MSFT","GOOGL","AMZN","QQQ","PLTR","CRDO","ALAB"}
+    if sym in CORE_BYPASS: return True
+    if sym in _trend_cache: return _trend_cache[sym]
+    try:
+        if df1d is None or len(df1d) < 50: return True
+        c = df1d["Close"]; price = float(c.iloc[-1])
+        ma50 = float(c.rolling(50).mean().iloc[-1])
+        if len(c) < 152:
+            res = price > ma50
+        elif len(c) < 252:
+            res = price > ma50 > float(c.rolling(150).mean().iloc[-1])
+        else:
+            ma150    = float(c.rolling(150).mean().iloc[-1])
+            ma200    = float(c.rolling(200).mean().iloc[-1])
+            ma200_old= float(c.rolling(200).mean().iloc[-22])
+            res = sum([price > ma50, ma50 > ma150, ma150 > ma200,
+                       ma200 > ma200_old,
+                       price >= float(c.tail(252).min()) * 1.25,
+                       price >= float(c.tail(252).max()) * 0.75]) >= 5
+        _trend_cache[sym] = res; return res
+    except: return True
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ⛈️ 暴跌預兆
 # ══════════════════════════════════════════════════════════════════════════════
-_crash_warned=set()
-
-def sig_crash(sym,tag,df5,df15,cache):
-    ck=f"crash_{sym}"
-    if not cooled(cache,ck,15) or len(df5)<20: return None
-    df=add_rsi(add_sma(df5,"Volume",15,"VMA"))
-    c=df.iloc[-1]; p=df.iloc[-2]
-    if pd.isna(c["VMA"]) or c["VMA"]<10: return None
-    vr=c["Volume"]/(c["VMA"]+1)
-    sup=df["Low"].tail(6).iloc[:-1].min()
-    smc=detect_smc(df15)
-    c1=c["Close"]<sup; c2=vr>2.0  # 妖股量薄，門檻降至2.0x
-    c3=c["Close"]<c["Open"]; c4=c["RSI"]<p["RSI"] and c["RSI"]<65
-    sc=sum([c1,c2,c3,c4]); g=grade(sc,4)
-    if not g or not(c1 and c2): return None
-    mark(cache,ck); _crash_warned.add(sym)
-    chg=(c["Close"]-df.iloc[0]["Open"])/df.iloc[0]["Open"]*100
-    return {"score":sc+10,"type":"⛈️","msg":fmt_msg(
-        tag,"⛈️","暴跌預兆",sym,g,c["Close"],chg,vr,c["RSI"],smc,
-        "敗象已現","高位爆量結構轉空，立刻減倉，切勿留過夜",
-        f"{L(c1)}破支撐 {L(c2)}放量 {L(c3)}收黑 {L(c4)}RSI背離")}
+def sig_crash(sym, tag, df5, df15, source, cache, earn_warn=""):
+    ck = f"crash_{sym}"
+    if not cooled(cache, ck, 15) or len(df5) < 20: return None
+    df = add_rsi(add_sma(df5, "Volume", 15, "VMA"))
+    c = df.iloc[-1]; p = df.iloc[-2]
+    if pd.isna(c["VMA"]) or c["VMA"] < 10: return None
+    vr = float(df["VR_Adj"].iloc[-1]) if "VR_Adj" in df.columns else c["Volume"] / (c["VMA"] + 1)
+    sup = df["Low"].tail(6).iloc[:-1].min()
+    smc = detect_smc(df15)
+    is_rocket = any(t in tag for t in VOLATILE_TAGS)
+    c1 = c["Close"] < sup
+    c2 = vr > (1.25 if is_rocket else 2.0)
+    c3 = c["Close"] < c["Open"]
+    c4 = c["RSI"] < p["RSI"] and c["RSI"] < 65
+    sc = sum([c1,c2,c3,c4]); g = grade(sc, 4)
+    if not g or not (c1 and c2): return None
+    mark(cache, ck); _crash_warned.add(sym)
+    chg = (c["Close"] - df.iloc[0]["Open"]) / df.iloc[0]["Open"] * 100
+    return {"score": sc+10, "type": "⛈️", "msg": fmt_msg(
+        tag, "⛈️", "暴跌預兆", sym, g, c["Close"], chg, vr, c["RSI"], smc,
+        "敗象已現", "高位爆量結構轉空，立刻減倉，切勿留過夜",
+        f"{L(c1)}破支撐 {L(c2)}放量({vr:.1f}x) {L(c3)}收黑 {L(c4)}RSI背離",
+        source=source, earn_warn=earn_warn)}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🔮 暴漲預兆（AXTI修正：妖股量比1.5x，假突破校驗折衷）
+# 🔮 暴漲預兆（整合大盤濾網 + 量能修正 + 倉位計算）
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_surge(sym,tag,df5,df15,source,cache):
-    """
-    Gemini合併版：妖股1.25x + 突增判斷 + 來源標籤
-    """
-    if source in ("none", "", None): return None  # 防呆：無有效資料來源
-    ck=f"surge_{sym}"
-    if not cooled(cache,ck,30) or len(df5)<20 or len(df15)<5: return None
-    df=add_rsi(add_sma(add_sma(df5,"Volume",15,"VMA"),"Volume",20,"VMA20"))
-    c=df.iloc[-1]; p=df.iloc[-2]
+def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
+              earn_warn="", stats=None, pf=None):
+    if source in ("none","",None): return None
+    ck = f"surge_{sym}"
+    if not cooled(cache, ck, 30) or len(df5) < 20 or len(df15) < 5: return None
+    df = add_atr(add_rsi(add_sma(df5, "Volume", 15, "VMA")))
+    c = df.iloc[-1]; p = df.iloc[-2]
+    is_rocket = any(t in tag for t in VOLATILE_TAGS)
 
-    is_rocket=any(t in tag for t in VOLATILE_TAGS)
-    min_vma=8 if is_rocket else 50
-    if pd.isna(c["VMA"]) or c["VMA"]<min_vma: return None
+    # 大盤濾網
+    if not regime_on and not is_rocket: return None
 
-    # ★ 妖股1.25x，龍頭2.5x（Gemini建議，比v8.5更寬鬆）
-    vol_thresh=1.25 if is_rocket else 2.5
-    if source=="yfinance": vol_thresh=max(vol_thresh*0.85,1.1)
+    chg = (c["Close"] - df.iloc[0]["Open"]) / df.iloc[0]["Open"] * 100
+    if chg < 0: return None
 
-    vr=c["Volume"]/(c["VMA"]+1)
+    min_vma = 8 if is_rocket else 50
+    if pd.isna(c["VMA"]) or c["VMA"] < min_vma: return None
 
-    # ★ 妖股額外突增判斷（Gemini新增，適合IEX薄量）
-    vol_surge=False
-    if is_rocket and len(df)>=15:
-        recent_vol=df["Volume"].tail(5).mean()
-        older_vol=df["Volume"].iloc[-15:-5].mean() or 1
-        vol_surge=recent_vol>older_vol*2.0
+    if "VR_Adj" in df.columns:
+        vr = float(df["VR_Adj"].iloc[-1])
+        vol_thresh = 0.8 if is_rocket else 1.5
+    else:
+        vr = c["Volume"] / (c["VMA"] + 1)
+        vol_thresh = 1.25 if is_rocket else 2.5
+        if source == "yfinance": vol_thresh = max(vol_thresh * 0.85, 1.1)
 
-    prev_hi=df["High"].tail(7).iloc[:-1].max()
-    smc=detect_smc(df15); c15=df15.iloc[-1]
+    vol_ok = vr > vol_thresh
+    vol_surge = False
+    if not vol_ok and is_rocket and len(df) >= 15:
+        recent_vol = df["Volume"].tail(5).mean()
+        older_vol  = df["Volume"].iloc[-15:-5].mean() or 1
+        vol_surge  = recent_vol > older_vol * 2.0
+        if vol_surge: vol_ok = True
 
-    c1=(vr>vol_thresh or vol_surge); c2=c["Close"]>prev_hi
-    c3=p["Close"]<=prev_hi
-    rsi_max=88 if is_rocket else 78
-    c4=52<c["RSI"]<rsi_max; c5=c15["Close"]>prev_hi
+    prev_hi = df["High"].tail(7).iloc[:-1].max()
+    smc = detect_smc(df15); c15 = df15.iloc[-1]
+    c1 = vol_ok; c2 = c["Close"] > prev_hi; c3 = p["Close"] <= prev_hi
+    rsi_max = 88 if is_rocket else 78
+    c4 = 52 < c["RSI"] < rsi_max; c5 = c15["Close"] > prev_hi
 
-    if not(c1 and c2 and c3):
-        if not c1: print(f"  {sym}: 量比{vr:.2f}x<{vol_thresh}x且無突增，跳過")
-        return None
-
-    sc=sum([c1,c2,c3,c4,c5]); g=grade(sc,5)
+    if not (c1 and c2 and c3): return None
+    sc = sum([c1,c2,c3,c4,c5]); g = grade(sc, 5)
     if not g: return None
 
-    valid,reason=validate_breakout(df,tag)
+    if g == "🏆 S級" and vr < 2.0 and "VR_Adj" not in df.columns:
+        g = "🥇 A級"
+
+    valid, reason = validate_breakout(df, tag)
     if not valid:
-        if sc==5:
-            mark(cache,ck)
-            return {"score":1,"type":"⚠️","msg":(
+        if sc == 5:
+            mark(cache, ck)
+            return {"score": 1, "type": "⚠️", "msg": (
                 f"{tag} ⚠️ *[假突破警告]* `{sym}` 原{g}→已過濾\n"
                 f"💰 現價:`{c['Close']:.2f}` · ❌ {reason}\n"
-                f"🚫 建議放棄，勿追\n⏰ {tw_time()} TWN")}
+                f"🚫 建議放棄{earn_warn}\n⏰ {tw_time()} TWN")}
         return None
 
-    mark(cache,ck)
-    chg=(c["Close"]-df.iloc[0]["Open"])/df.iloc[0]["Open"]*100
-    src_lbl="IEX即時" if source=="alpaca" else "yf延遲"
-    vol_note=f"突增{df['Volume'].tail(5).mean()/max(df['Volume'].iloc[-15:-5].mean(),1):.1f}x" if vol_surge else f"{vr:.1f}x"
-    extra=f"條件:`{sc}/5` · 突破:`{prev_hi:.2f}` · 量:{vol_note}({src_lbl})"
-    if sym in _crash_warned:
-        extra+="\n⚠️ 本日有暴跌預兆，此為反彈，謹慎"
-    return {"score":sc,"type":"🔮","msg":fmt_msg(
-        tag,"🔮","暴漲預兆",sym,g,c["Close"],chg,vr,c["RSI"],smc,
-        "確診發動","帶量突破，分批進場，SAR翻轉即停損",
+    mark(cache, ck)
+
+    atr_val    = float(c["ATR"]) if not pd.isna(c["ATR"]) else c["Close"] * 0.02
+    stop_price = c["Close"] - atr_val * (1.5 if is_rocket else 1.0)
+    target     = c["Close"] + abs(c["Close"] - stop_price) * 2
+    shares     = calc_position(c["Close"], stop_price, "SURGE", stats, pf)
+    if shares > 0:
+        log_forward_test(sym, "SURGE", c["Close"], stop_price, target, shares)
+
+    vol_note = (f"突增{df['Volume'].tail(5).mean()/max(df['Volume'].iloc[-15:-5].mean(),1):.1f}x"
+                if vol_surge else f"{vr:.1f}x")
+    extra = f"條件:`{sc}/5` · 突破:`{prev_hi:.2f}`"
+    if sym in _crash_warned: extra += "\n⚠️ 本日有暴跌預兆，此為反彈，謹慎"
+    if stats and stats.sample_size >= 15:
+        extra += f"\n📈 歷史:{stats.sample_size}筆 勝率:{stats.winrate:.0%} 期望:{stats.expectancy_r:.2f}R"
+
+    return {"score": sc, "type": "🔮", "msg": fmt_msg(
+        tag, "🔮", "暴漲預兆", sym, g, c["Close"], chg, vr, c["RSI"], smc,
+        "確診發動", "帶量突破，分批進場，SAR翻轉即停損",
         f"{L(c1)}量{vol_note} {L(c2)}突破前高 {L(c3)}剛發動 {L(c4)}RSI {L(c5)}15m確認",
-        extra,source)}
+        extra, source, shares, stop_price, earn_warn)}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🌅 盤前跳空（完全不看實體，純量價結構）
+# 🌅 盤前跳空
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_pregap(sym,tag,cache):
-    ck=f"pregap_{sym}_{_ny().strftime('%Y%m%d')}"
-    if not cooled(cache,ck,720): return None
+def sig_pregap(sym, tag, cache, earn_warn=""):
+    ck = f"pregap_{sym}_{_ny().strftime('%Y%m%d')}"
+    if not cooled(cache, ck, 720): return None
     try:
-        # Polygon已退費，盤前跳空改用Alpaca 1分鐘線
-        pre_df=get_alpaca(sym,'1Min',90)
-        if pre_df.empty: pre_df=get_yf(sym,'1m','2d')  # yfinance fallback
+        pre_df = get_alpaca(sym, "1Min", 90)
+        if pre_df.empty: pre_df = get_yf(sym, "1m", "2d")
         if pre_df.empty: return None
-        ny_today=_ny().date()
-        pre=pre_df[(pre_df.index.date==ny_today)&
-                   ((pre_df.index.hour<9)|
-                    ((pre_df.index.hour==9)&(pre_df.index.minute<30)))]
-        if len(pre)<5: return None
-        df1d=get_yf(sym,"1d","20d")
-        if len(df1d)<6: return None
-        yest_close=float(df1d["Close"].iloc[-2])
-        avg_vol=float(df1d["Volume"].tail(5).mean())
-        pre_price=float(pre.iloc[-1]["Close"])
-        pre_vol=float(pre["Volume"].sum())
-        chg=(pre_price-yest_close)/yest_close*100
-
-        is_rocket=any(t in tag for t in VOLATILE_TAGS)
-        min_abs=30000 if is_rocket else 100000
-        G1=chg>5.0
-        G2=pre_vol>avg_vol*1.5 and pre_vol>min_abs
-        df1d_rsi=add_rsi(df1d)
-        yest_rsi=float(df1d_rsi["RSI"].iloc[-2]) if not pd.isna(df1d_rsi["RSI"].iloc[-2]) else 50
-        G3=yest_rsi<75  # 妖股RSI可以高一點
-        recent=pre.tail(30)
-        G4=float(recent["Volume"].tail(10).mean())>float(recent["Volume"].head(10).mean())*0.7
-
-        if not(G1 and G2): return None
-        sc=sum([G1,G2,G3,G4])
-        g="🏆 S級" if sc==4 else "🥇 A級"
-        mark(cache,ck)
-        vr=pre_vol/(avg_vol+1)
-        warn=" ⚠️ 昨日RSI偏高，注意高開低走" if yest_rsi>=70 else ""
-        advice=(f"盤前爆量跳空+{chg:.1f}%，開盤前5分鐘觀察縮量回測，"
-                f"確認站穩再進，止損昨收{yest_close:.2f}{warn}")
-        hint=PORTFOLIO_HINTS.get(sym,"")
-        return {"score":sc+8,"type":"🌅","msg":(
-            f"{tag} 🌅 *[盤前跳空]* `{sym}` {g}\n"
+        ny_today = _ny().date()
+        pre = pre_df[(pre_df.index.date == ny_today) &
+                     ((pre_df.index.hour < 9) |
+                      ((pre_df.index.hour == 9) & (pre_df.index.minute < 30)))]
+        if len(pre) < 5: return None
+        df1d = get_yf(sym, "1d", "20d")
+        if len(df1d) < 6: return None
+        yest_close = float(df1d["Close"].iloc[-2])
+        avg_vol    = float(df1d["Volume"].tail(5).mean())
+        pre_price  = float(pre.iloc[-1]["Close"])
+        pre_vol    = float(pre["Volume"].sum())
+        chg = (pre_price - yest_close) / yest_close * 100
+        is_rocket = any(t in tag for t in VOLATILE_TAGS)
+        min_abs = 30000 if is_rocket else 100000
+        G1 = chg > 5.0
+        G2 = pre_vol > avg_vol * 1.5 and pre_vol > min_abs
+        df1d_rsi = add_rsi(df1d)
+        yest_rsi = float(df1d_rsi["RSI"].iloc[-2]) if not pd.isna(df1d_rsi["RSI"].iloc[-2]) else 50
+        G3 = yest_rsi < 75
+        recent = pre.tail(30)
+        G4 = float(recent["Volume"].tail(10).mean()) > float(recent["Volume"].head(10).mean()) * 0.7
+        if not (G1 and G2): return None
+        sc = sum([G1,G2,G3,G4]); g = "🏆 S級" if sc == 4 else "🥇 A級"
+        mark(cache, ck)
+        vr   = pre_vol / (avg_vol + 1)
+        warn = " ⚠️ 昨RSI偏高，注意高開低走" if yest_rsi >= 70 else ""
+        advice = (f"盤前爆量跳空+{chg:.1f}%，開盤前5分鐘觀察縮量回測，"
+                  f"確認站穩再進，止損昨收{yest_close:.2f}{warn}")
+        hint = PORTFOLIO_HINTS.get(sym, "")
+        return {"score": sc+8, "type": "🌅", "msg": (
+            f"{tag} 🌅 *[盤前跳空]* `{sym}` {g}{earn_warn}\n"
             f"💰 盤前:`{pre_price:.2f}` · 📈:`{chg:+.1f}%` vs 昨收`{yest_close:.2f}`\n"
             f"📊 量比:`{vr:.1f}x` · 絕對量:`{pre_vol/1000:.0f}K` · 昨RSI:`{yest_rsi:.0f}`\n"
-            f"燈號: {L(G1)}跳空>5% {L(G2)}量>1.5x({min_abs//1000}K最低) {L(G3)}RSI可控 {L(G4)}量持續\n"
-            +(f"📌 {hint}\n" if hint else "")
-            +f"🎫 *[盤前機會]*: {advice}\n"
-            f"⏰ {tw_time()} TWN")}
+            f"燈號:{L(G1)}跳空>5% {L(G2)}量>1.5x {L(G3)}RSI可控 {L(G4)}量持續\n"
+            + (f"📌 {hint}\n" if hint else "")
+            + f"🎫 *[盤前機會]*: {advice}\n"
+              f"⏰ {tw_time()} TWN")}
     except Exception as e:
         print(f"  盤前{sym}: {e}"); return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ⚡ WASHOUT
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_washout(sym,tag,df5,df15,status,cache):
-    ck=f"wash_{sym}"
-    if not cooled(cache,ck,30) or len(df5)<6 or len(df15)<3: return None
-    df=add_rsi(add_sma(add_sma(add_sma(df5,"Volume",10,"V10"),"Close",5,"MA5"),"Close",20,"MA20"))
-    c=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3]
+def sig_washout(sym, tag, df5, df15, status, cache, earn_warn="", stats=None, pf=None):
+    ck = f"wash_{sym}"
+    if not cooled(cache, ck, 30) or len(df5) < 6 or len(df15) < 3: return None
+    df = add_rsi(add_sma(add_sma(add_sma(df5,"Volume",10,"V10"),"Close",5,"MA5"),"Close",20,"MA20"))
+    c = df.iloc[-1]; p = df.iloc[-2]; p2 = df.iloc[-3]
     if pd.isna(c["MA5"]): return None
-    day_open=get_day_open(df)
+    day_open = get_day_open(df)
     if day_open is None: return None
-    day_low=df["Low"].min()
-    yest=df[df.index.date<df.index[-1].date()]
-    yest_low=yest["Low"].min() if not yest.empty else day_low*0.97
-    drop=(day_open-day_low)/day_open*100
-    rebound=(c["Close"]-day_low)/(day_open-day_low+0.001)
-    vr=c["Volume"]/(c["V10"]+1)
-    smc=detect_smc(df15)
-    min_drop=1.5 if "🚀" not in tag else 2.0
-    c1=drop>min_drop; c2=c["Close"]>=day_open*0.998; c3=p["Close"]<day_open
-    c4=(c["RSI"]>p["RSI"]>p2["RSI"]) and (c["RSI"]-p2["RSI"]>3)
-    c5=c["RSI"]<72; c6=c["Close"]>yest_low; c7=rebound>0.5; c8=c["MA5"]>c["MA20"]
-    if not(c1 and c2 and vr>0.3): return None
-    sc=sum([c1,c2,c3,c4,c5,c6,c7,c8]); g=grade(sc,8)
+    day_low  = float(df["Low"].min())
+    yest     = df[df.index.date < df.index[-1].date()]
+    yest_low = float(yest["Low"].min()) if not yest.empty else day_low * 0.97
+    drop     = (day_open - day_low) / day_open * 100
+    rebound  = (float(c["Close"]) - day_low) / (day_open - day_low + 0.001)
+    vr       = c["Volume"] / (c["V10"] + 1)
+    smc      = detect_smc(df15)
+    min_drop = 1.5 if "🚀" not in tag else 2.0
+    c1 = drop > min_drop; c2 = c["Close"] >= day_open * 0.998; c3 = p["Close"] < day_open
+    c4 = (c["RSI"] > p["RSI"] > p2["RSI"]) and (c["RSI"] - p2["RSI"] > 3)
+    c5 = c["RSI"] < 72; c6 = c["Close"] > yest_low; c7 = rebound > 0.5; c8 = c["MA5"] > c["MA20"]
+    if not (c1 and c2 and vr > 0.3): return None
+    sc = sum([c1,c2,c3,c4,c5,c6,c7,c8]); g = grade(sc, 8)
     if not g: return None
-    stop,stop_m=dynamic_stop(df,day_low,tag)
-    rr=(c["Close"]*1.02-c["Close"])/(c["Close"]-stop+0.001)
-    if rr<1.5: return None
-    mark(cache,ck)
-    chg=(c["Close"]-day_open)/day_open*100
-    prefix="盤前洗盤" if status=="PRE" else "洗盤結束"
-    warn=" ⚠️ RSI偏高等回測5MA" if c["RSI"]>65 else ""
-    if sym in _crash_warned: warn+=f" ⚠️ 本日有暴跌預兆，謹慎"
-    return {"score":sc,"type":"⚡","msg":fmt_msg(
-        tag,"⚡","WASHOUT",sym,g,c["Close"],chg,vr,c["RSI"],smc,
-        prefix,f"大幅殺低帶量站回，止損{stop:.2f}({stop_m})",
+    stop, stop_m = dynamic_stop(df, day_low, tag)
+    rr = (c["Close"] * 1.02 - c["Close"]) / (c["Close"] - stop + 0.001)
+    if rr < 1.5: return None
+    mark(cache, ck)
+
+    shares = calc_position(c["Close"], stop, "WASHOUT", stats, pf)
+    target = c["Close"] + (c["Close"] - stop) * 2
+    if shares > 0:
+        log_forward_test(sym, "WASHOUT", c["Close"], stop, target, shares)
+
+    chg    = (float(c["Close"]) - day_open) / day_open * 100
+    prefix = "盤前洗盤" if status == "PRE" else "洗盤結束"
+    warn   = " ⚠️ RSI偏高等回測5MA" if c["RSI"] > 65 else ""
+    if sym in _crash_warned: warn += " ⚠️ 本日有暴跌預兆，謹慎"
+    extra = f"條件:`{sc}/8` 反彈:`{rebound*100:.0f}%` 風報:`{rr:.1f}x`{warn}"
+    if stats and stats.sample_size >= 15:
+        extra += f"\n📈 歷史:{stats.sample_size}筆 勝率:{stats.winrate:.0%}"
+    return {"score": sc, "type": "⚡", "msg": fmt_msg(
+        tag, "⚡", "WASHOUT", sym, g, c["Close"], chg, vr, c["RSI"], smc,
+        prefix, f"大幅殺低帶量站回，止損{stop:.2f}({stop_m})",
         f"{L(c1)}殺低 {L(c2)}站回 {L(c3)}剛翻 {L(c4)}RSI勾 "
         f"{L(c5)}非追高 {L(c6)}守昨低 {L(c7)}彈力 {L(c8)}MA翻多",
-        f"條件:`{sc}/8` 反彈:`{rebound*100:.0f}%` 風報:`{rr:.1f}x`{warn}")}
+        extra, "", shares, stop, earn_warn)}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 📈 波段PULLBACK
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_pullback(sym,tag,df1d,df5,cache):
-    ck=f"pull_{sym}"
-    if not cooled(cache,ck,60) or len(df1d)<65 or len(df5)<3: return None
-    d=add_macd(add_rsi(add_sma(add_sma(df1d,"Close",60,"MA60"),"Volume",5,"V5")))
-    f=add_rsi(df5)
-    dc=d.iloc[-1]; dp=d.iloc[-2]; fc=f.iloc[-1]; fp=f.iloc[-2]
+def sig_pullback(sym, tag, df1d, df5, cache, earn_warn="", pf=None):
+    ck = f"pull_{sym}"
+    if not cooled(cache, ck, 60) or len(df1d) < 65 or len(df5) < 3: return None
+    d  = add_macd(add_rsi(add_sma(add_sma(df1d,"Close",60,"MA60"),"Volume",5,"V5")))
+    f  = add_rsi(df5)
+    dc = d.iloc[-1]; dp = d.iloc[-2]; fc = f.iloc[-1]; fp = f.iloc[-2]
     if pd.isna(dc["MA60"]) or pd.isna(dc["RSI"]): return None
-    bias=(dc["Close"]-dc["MA60"])/dc["MA60"]*100
-    vr=dc["Volume"]/(dc["V5"]+1)
-    c1=dc["Close"]>dc["MA60"]; c2=42<=dp["RSI"]<=58 and dc["RSI"]>dp["RSI"]
-    c3=vr<0.85; c4=0<=bias<5; c5=fc["RSI"]>fp["RSI"]; c6=dc["MACD_hist"]>dp["MACD_hist"]
-    sc=sum([c1,c2,c3,c4,c5,c6]); g=grade(sc,6)
-    if not g or not(c1 and c2): return None
-    mark(cache,ck)
-    sp=dc["Close"]*0.95
+    bias = (dc["Close"] - dc["MA60"]) / dc["MA60"] * 100
+    vr   = dc["Volume"] / (dc["V5"] + 1)
+    c1 = dc["Close"] > dc["MA60"]; c2 = 42 <= dp["RSI"] <= 58 and dc["RSI"] > dp["RSI"]
+    c3 = vr < 0.85; c4 = 0 <= bias < 5; c5 = fc["RSI"] > fp["RSI"]
+    c6 = dc["MACD_hist"] > dp["MACD_hist"]
+    sc = sum([c1,c2,c3,c4,c5,c6]); g = grade(sc, 6)
+    if not g or not (c1 and c2): return None
+    mark(cache, ck)
+    stop_est = float(dc["MA60"]) * 0.99
+    shares   = calc_position(float(dc["Close"]), stop_est, "VCP", None, pf)
+    sp = dc["Close"] * 0.95
     if sym in _crash_warned:
-        advice=f"⚠️ 本日有暴跌預兆，PULLBACK可能是誘多，暫緩"
+        advice = "⚠️ 本日有暴跌預兆，PULLBACK可能誘多，暫緩"
     else:
-        advice=f"縮量回測季線RSI勾頭，Sell Put:{sp:.1f}(-5%)，守季線{dc['MA60']:.2f}"
-    return {"score":sc,"type":"📈","msg":fmt_msg(
-        tag,"📈","波段PULLBACK",sym,g,dc["Close"],0,vr,dc["RSI"],"日線",
-        "候補進場",advice,
+        advice = f"縮量回測季線RSI勾頭，Sell Put:{sp:.1f}(-5%)，守季線{dc['MA60']:.2f}"
+    extra = f"條件:`{sc}/6` 距季線:`{bias:.1f}%` 量能:`{vr:.2f}x`"
+    return {"score": sc, "type": "📈", "msg": fmt_msg(
+        tag, "📈", "波段PULLBACK", sym, g, dc["Close"], 0, vr, dc["RSI"], "日線",
+        "候補進場", advice,
         f"{L(c1)}季線上 {L(c2)}RSI勾頭 {L(c3)}縮量 {L(c4)}貼季線 {L(c5)}5m確認 {L(c6)}MACD",
-        f"條件:`{sc}/6` 距季線:`{bias:.1f}%` 量能:`{vr:.2f}x`")}
+        extra, "", shares, stop_est, earn_warn)}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🏦 SMC（完整版：OB+FVG+BOS/CHoCH，加doc2實體中心校驗）
+# 🏦 SMC（OB/FVG/BOS/CHoCH 完整版）
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_smc(sym,tag,df15,df1d,cache):
-    ck=f"smc_{sym}"
-    if not cooled(cache,ck,60) or len(df15)<30 or len(df1d)<20: return None
+def sig_smc(sym, tag, df15, df1d, cache, pf=None):
+    ck = f"smc_{sym}"
+    if not cooled(cache, ck, 60) or len(df15) < 30 or len(df1d) < 20: return None
+    results    = []; curr_price = float(df15["Close"].iloc[-1])
+    hi10 = df1d["High"].tail(10).values; lo10 = df1d["Low"].tail(10).values
+    bull_str = (hi10[-3:].max() > hi10[:5].max() and lo10[-3:].min() > lo10[:5].min())
+    bear_str = (hi10[-3:].max() < hi10[:5].max() and lo10[-3:].min() < lo10[:5].min())
 
-    results=[]; curr_price=float(df15["Close"].iloc[-1])
-
-    hi10=df1d["High"].tail(10).values; lo10=df1d["Low"].tail(10).values
-    bull_str=(hi10[-3:].max()>hi10[:5].max() and lo10[-3:].min()>lo10[:5].min())
-    bear_str=(hi10[-3:].max()<hi10[:5].max() and lo10[-3:].min()<lo10[:5].min())
-
-    def find_ob(df,mode="bull"):
-        for i in range(3,min(25,len(df)-2)):
-            bar=df.iloc[-i]; after=df.iloc[-i+1:]; next3=df.iloc[-i+1:-i+4]
-            if len(next3)<3: continue
-            if mode=="bull":
-                if not(bar["Close"]<bar["Open"]): continue
-                strong=(next3["Close"].iloc[-1]>bar["High"] and
-                        (next3["Close"].iloc[-1]-bar["Low"])/(bar["Low"]+1e-9)>0.005)
+    def find_ob(df, mode="bull"):
+        for i in range(3, min(25, len(df)-2)):
+            bar = df.iloc[-i]; after = df.iloc[-i+1:]; next3 = df.iloc[-i+1:-i+4]
+            if len(next3) < 3: continue
+            if mode == "bull":
+                if not (bar["Close"] < bar["Open"]): continue
+                strong = (next3["Close"].iloc[-1] > bar["High"] and
+                          (next3["Close"].iloc[-1]-bar["Low"])/(bar["Low"]+1e-9) > 0.005)
                 if not strong: continue
-                ob_h,ob_l=float(bar["High"]),float(bar["Low"])
-                if (after["Close"]<ob_l).any(): continue
-                if ob_l<=curr_price<=ob_h*1.005:
-                    # ★ doc2實體中心校驗：K線實體中心必須在OB上方
-                    curr_k=df.iloc[-1]
-                    body_mid=(float(curr_k["Open"])+float(curr_k["Close"]))/2
-                    if body_mid<ob_l: continue  # 插針洗盤，非有效支撐
-                    return {"high":ob_h,"low":ob_l,"age":i}
+                ob_h, ob_l = float(bar["High"]), float(bar["Low"])
+                if (after["Close"] < ob_l).any(): continue
+                if ob_l <= curr_price <= ob_h * 1.005:
+                    body_mid = (float(df.iloc[-1]["Open"]) + float(df.iloc[-1]["Close"])) / 2
+                    if body_mid < ob_l: continue
+                    return {"high": ob_h, "low": ob_l}
             else:
-                if not(bar["Close"]>bar["Open"]): continue
-                strong=(next3["Close"].iloc[-1]<bar["Low"] and
-                        (bar["High"]-next3["Close"].iloc[-1])/(bar["High"]+1e-9)>0.005)
+                if not (bar["Close"] > bar["Open"]): continue
+                strong = (next3["Close"].iloc[-1] < bar["Low"] and
+                          (bar["High"]-next3["Close"].iloc[-1])/(bar["High"]+1e-9) > 0.005)
                 if not strong: continue
-                ob_h,ob_l=float(bar["High"]),float(bar["Low"])
-                if (after["Close"]>ob_h).any(): continue
-                if ob_l*0.995<=curr_price<=ob_h:
-                    curr_k=df.iloc[-1]
-                    body_mid=(float(curr_k["Open"])+float(curr_k["Close"]))/2
-                    if body_mid>ob_h: continue
-                    return {"high":ob_h,"low":ob_l,"age":i}
+                ob_h, ob_l = float(bar["High"]), float(bar["Low"])
+                if (after["Close"] > ob_h).any(): continue
+                if ob_l * 0.995 <= curr_price <= ob_h:
+                    body_mid = (float(df.iloc[-1]["Open"]) + float(df.iloc[-1]["Close"])) / 2
+                    if body_mid > ob_h: continue
+                    return {"high": ob_h, "low": ob_l}
         return None
 
-    def find_fvg(df,mode="bull"):
-        for i in range(2,min(20,len(df)-1)):
-            b1=df.iloc[-i-1]; b3=df.iloc[-i+1]
-            if mode=="bull":
-                if float(b1["High"])<float(b3["Low"]):
-                    top,bot=float(b3["Low"]),float(b1["High"])
-                    if bot<=curr_price<=top:
-                        return {"top":top,"bot":bot,"age":i}
+    def find_fvg(df, mode="bull"):
+        for i in range(2, min(20, len(df)-1)):
+            b1 = df.iloc[-i-1]; b3 = df.iloc[-i+1]
+            if mode == "bull":
+                if float(b1["High"]) < float(b3["Low"]):
+                    top, bot = float(b3["Low"]), float(b1["High"])
+                    if bot <= curr_price <= top: return {"top": top, "bot": bot}
             else:
-                if float(b1["Low"])>float(b3["High"]):
-                    top,bot=float(b1["Low"]),float(b3["High"])
-                    if bot<=curr_price<=top:
-                        return {"top":top,"bot":bot,"age":i}
+                if float(b1["Low"]) > float(b3["High"]):
+                    top, bot = float(b1["Low"]), float(b3["High"])
+                    if bot <= curr_price <= top: return {"top": top, "bot": bot}
         return None
 
-    bull_ob=find_ob(df15,"bull"); bear_ob=find_ob(df15,"bear")
-    bull_fvg=find_fvg(df15,"bull"); bear_fvg=find_fvg(df15,"bear")
-    sw_high=float(df15["High"].tail(15).iloc[:-2].max())
-    sw_low=float(df15["Low"].tail(15).iloc[:-2].min())
-    bos_b=curr_price>sw_high; bos_r=curr_price<sw_low
-    choch_b=bos_b and bear_str; choch_r=bos_r and bull_str
-
-    crash_note=f"⚠️ {sym} 本日有暴跌預兆，謹慎操作\n" if sym in _crash_warned else ""
+    bull_ob  = find_ob(df15, "bull"); bear_ob  = find_ob(df15, "bear")
+    bull_fvg = find_fvg(df15, "bull"); bear_fvg = find_fvg(df15, "bear")
+    sw_hi = float(df15["High"].tail(15).iloc[:-2].max())
+    sw_lo = float(df15["Low"].tail(15).iloc[:-2].min())
+    bos_b = curr_price > sw_hi; bos_r = curr_price < sw_lo
+    choch_b = bos_b and bear_str; choch_r = bos_r and bull_str
+    crash_note = f"⚠️ 本日有暴跌預兆，謹慎\n" if sym in _crash_warned else ""
 
     if bull_str and (bull_ob or bull_fvg) and (bos_b or choch_b):
-        bs=sum([bull_str,bool(bull_ob),bool(bull_fvg),bos_b,choch_b]); g=grade(bs,5)
+        bs = sum([bull_str, bool(bull_ob), bool(bull_fvg), bos_b, choch_b]); g = grade(bs, 5)
         if g:
-            mark(cache,ck)
-            stop=(bull_ob["low"] if bull_ob else bull_fvg["bot"])*0.995
-            target=curr_price+(curr_price-stop)*2
-            ctag=" *CHoCH反轉*" if choch_b else " BOS順勢"
-            results.append({"score":bs,"type":"🏦","msg":(
+            mark(cache, ck)
+            stop   = (bull_ob["low"] if bull_ob else bull_fvg["bot"]) * 0.995
+            target = curr_price + (curr_price - stop) * 2
+            shares = calc_position(curr_price, stop, "SURGE", None, pf)
+            ctag   = " *CHoCH反轉*" if choch_b else " BOS順勢"
+            results.append({"score": bs, "type": "🏦", "msg": (
                 f"{tag} 🏦 *[SMC 多頭]{ctag}* `{sym}` {g}\n"
                 f"💰 現價:`{curr_price:.2f}`\n"
-                f"燈號:{L(bull_str)}日線牛市 {L(bool(bull_ob))}OB有效 "
-                f"{L(bool(bull_fvg))}FVG {L(bos_b)}BOS {L(choch_b)}CHoCH\n"
-                +(f"📦 OB:`{bull_ob['low']:.2f}~{bull_ob['high']:.2f}`\n" if bull_ob else "")
-                +(f"🕳️ FVG:`{bull_fvg['bot']:.2f}~{bull_fvg['top']:.2f}`\n" if bull_fvg else "")
-                +f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)\n"
-                +crash_note+f"⏰ {tw_time()} TWN")})
+                f"燈號:{L(bull_str)}日線牛市 {L(bool(bull_ob))}OB {L(bool(bull_fvg))}FVG "
+                f"{L(bos_b)}BOS {L(choch_b)}CHoCH\n"
+                + (f"📦 OB:`{bull_ob['low']:.2f}~{bull_ob['high']:.2f}`\n" if bull_ob else "")
+                + (f"🕳️ FVG:`{bull_fvg['bot']:.2f}~{bull_fvg['top']:.2f}`\n" if bull_fvg else "")
+                + f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)"
+                + (f" · 建議倉位:`{shares}股`" if shares > 0 else "") + "\n"
+                + crash_note + f"⏰ {tw_time()} TWN")})
 
     if bear_str and (bear_ob or bear_fvg) and (bos_r or choch_r):
-        bs=sum([bear_str,bool(bear_ob),bool(bear_fvg),bos_r,choch_r]); g=grade(bs,5)
+        bs = sum([bear_str, bool(bear_ob), bool(bear_fvg), bos_r, choch_r]); g = grade(bs, 5)
         if g:
-            mark(cache,ck)
-            stop=(bear_ob["high"] if bear_ob else bear_fvg["top"])*1.005
-            target=curr_price-(stop-curr_price)*2
-            ctag=" *CHoCH反轉*" if choch_r else " BOS順勢"
-            results.append({"score":bs,"type":"🏦","msg":(
+            mark(cache, ck)
+            stop   = (bear_ob["high"] if bear_ob else bear_fvg["top"]) * 1.005
+            target = curr_price - (stop - curr_price) * 2
+            ctag   = " *CHoCH反轉*" if choch_r else " BOS順勢"
+            results.append({"score": bs, "type": "🏦", "msg": (
                 f"{tag} 🏦 *[SMC 空頭]{ctag}* `{sym}` {g}\n"
                 f"💰 現價:`{curr_price:.2f}`\n"
-                f"燈號:{L(bear_str)}日線熊市 {L(bool(bear_ob))}OB有效 "
-                f"{L(bool(bear_fvg))}FVG {L(bos_r)}BOS {L(choch_r)}CHoCH\n"
-                +(f"📦 OB:`{bear_ob['low']:.2f}~{bear_ob['high']:.2f}`\n" if bear_ob else "")
-                +(f"🕳️ FVG:`{bear_fvg['bot']:.2f}~{bear_fvg['top']:.2f}`\n" if bear_fvg else "")
-                +f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)\n"
-                +crash_note+f"⏰ {tw_time()} TWN")})
+                f"燈號:{L(bear_str)}日線熊市 {L(bool(bear_ob))}OB {L(bool(bear_fvg))}FVG "
+                f"{L(bos_r)}BOS {L(choch_r)}CHoCH\n"
+                + (f"📦 OB:`{bear_ob['low']:.2f}~{bear_ob['high']:.2f}`\n" if bear_ob else "")
+                + (f"🕳️ FVG:`{bear_fvg['bot']:.2f}~{bear_fvg['top']:.2f}`\n" if bear_fvg else "")
+                + f"🎯 止損:`{stop:.2f}` 目標:`{target:.2f}` (1:2)\n"
+                + crash_note + f"⏰ {tw_time()} TWN")})
 
     return results if results else None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 🎯 VCP Pro
 # ══════════════════════════════════════════════════════════════════════════════
-def scan_vcp(ticker_list, cache):
-    results=[]
+def scan_vcp(ticker_list, cache, stats=None, pf=None):
+    results = []
     for sym in ticker_list:
-        ck=f"vcp_{sym}"
-        if not cooled(cache,ck,120): continue
+        ck = f"vcp_{sym}"
+        if not cooled(cache, ck, 120): continue
         try:
-            df=_clean(yf.download(sym,period="6mo",progress=False,auto_adjust=True))
-            if len(df)<50: continue
-            curr=float(df["Close"].iloc[-1])
-            df["MA50"]=df["Close"].rolling(50).mean()
-            ma50=float(df["MA50"].iloc[-1])
-            bias=(curr-ma50)/ma50*100
-            vol_50=float(df["Volume"].rolling(50).mean().iloc[-1])
-            vol_5=float(df["Volume"].iloc[-5:].mean())
-            vol_dry=vol_5<vol_50*0.7
-            std_r=float(df["High"].iloc[-10:].std())
-            std_p=float(df["High"].iloc[-30:-10].std())
-            is_tight=std_r<std_p and std_p>0
-            low_r=float(df["Low"].iloc[-5:].min())
-            low_p=float(df["Low"].iloc[-15:-5].min())
-            higher_low=low_r>low_p
-            pivot=float(df["High"].iloc[-10:].max())
-            dist=(pivot+0.05-curr)/curr*100
-            conds=sum([vol_dry,is_tight,higher_low])
-            should_alert=(conds==3 or (conds==2 and 0<dist<5))
-            if not should_alert: continue
-            status="🔥 準備突破" if (conds==3 and 0<dist<3 and bias<25) else "👀 觀察中"
-            mark(cache,ck)
-            results.append({"score":conds*3+(3 if status=="🔥 準備突破" else 0),"type":"🎯","msg":(
+            df = _clean(yf.download(sym, period="6mo", progress=False, auto_adjust=True))
+            if len(df) < 50: continue
+            curr  = float(df["Close"].iloc[-1])
+            df["MA50"] = df["Close"].rolling(50).mean()
+            ma50  = float(df["MA50"].iloc[-1])
+            bias  = (curr - ma50) / ma50 * 100
+            vol_50 = float(df["Volume"].rolling(50).mean().iloc[-1])
+            vol_5  = float(df["Volume"].iloc[-5:].mean())
+            vol_dry   = vol_5 < vol_50 * 0.7
+            std_r     = float(df["High"].iloc[-10:].std())
+            std_p     = float(df["High"].iloc[-30:-10].std())
+            is_tight  = std_r < std_p and std_p > 0
+            low_r     = float(df["Low"].iloc[-5:].min())
+            low_p     = float(df["Low"].iloc[-15:-5].min())
+            higher_low = low_r > low_p
+            pivot = float(df["High"].iloc[-10:].max())
+            dist  = (pivot + 0.05 - curr) / curr * 100
+            conds = sum([vol_dry, is_tight, higher_low])
+            if not (conds == 3 or (conds == 2 and 0 < dist < 5)): continue
+            status_lbl = "🔥 準備突破" if (conds == 3 and 0 < dist < 3 and bias < 25) else "👀 觀察中"
+            mark(cache, ck)
+            stop_est = curr * 0.93
+            shares   = calc_position(curr, stop_est, "VCP", stats, pf)
+            target   = curr + (curr - stop_est) * 3
+            if shares > 0:
+                log_forward_test(sym, "VCP", curr, stop_est, target, shares)
+            stat_line = ""
+            if stats and stats.sample_size >= 15:
+                stat_line = f"\n📈 歷史:{stats.sample_size}筆 勝率:{stats.winrate:.0%} 期望:{stats.expectancy_r:.2f}R"
+            results.append({"score": conds*3 + (3 if status_lbl == "🔥 準備突破" else 0), "type": "🎯",
+                            "msg": (
                 f"🔍 🎯 *[VCP Pro]* `{sym}` {'🏆 S級' if conds==3 else '🥇 A級'}\n"
                 f"💰 現價:`{curr:.2f}` · 50MA乖離:`{bias:.1f}%`\n"
                 f"燈號:{L(vol_dry)}量縮 {L(is_tight)}波動收縮 {L(higher_low)}支撐墊高\n"
                 f"📊 量比:`{vol_5/vol_50:.2f}x` · 距支點:`{dist:.1f}%`\n"
-                f"狀態: {status}\n⏰ {tw_time()} TWN")})
+                f"🛡️ 建議:`{shares}股` · 止損:`{stop_est:.2f}` · 目標:`{target:.2f}`\n"
+                f"狀態:{status_lbl}{stat_line}\n⏰ {tw_time()} TWN")})
         except Exception as e: print(f"  VCP {sym}: {e}")
     return results
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ₿ 半木夏三背離
 # ══════════════════════════════════════════════════════════════════════════════
-def sig_banmuxa(yf_sym,disp,df15,cache):
-    ck=f"bmx_{disp}"
-    if not cooled(cache,ck,240) or len(df15)<120: return None
-    df=add_atr(add_macd(df15.copy()))
-    hist=df["MACD_hist"].values
-    high=df["High"].values; low=df["Low"].values
-    c=df.iloc[-1]; atr=float(c["ATR"]) if not pd.isna(c["ATR"]) else 0
-    price=float(c["Close"])
+def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
+    ck = f"bmx_{disp}"
+    if not cooled(cache, ck, 240) or len(df15) < 120: return None
+    df   = add_atr(add_macd(df15.copy()))
+    hist = df["MACD_hist"].values; high = df["High"].values; low = df["Low"].values
+    c    = df.iloc[-1]; atr = float(c["ATR"]) if not pd.isna(c["ATR"]) else 0
+    price = float(c["Close"])
 
-    def extremes(arr,w=5,mode="peak"):
-        out=[]
-        for i in range(w,len(arr)-w):
-            seg=arr[i-w:i+w+1]
-            if mode=="peak"   and arr[i]==max(seg) and arr[i]>0: out.append(i)
-            if mode=="trough" and arr[i]==min(seg) and arr[i]<0: out.append(i)
+    def extremes(arr, w=5, mode="peak"):
+        out = []
+        for i in range(w, len(arr)-w):
+            seg = arr[i-w:i+w+1]
+            if mode == "peak"   and arr[i] == max(seg) and arr[i] > 0: out.append(i)
+            if mode == "trough" and arr[i] == min(seg) and arr[i] < 0: out.append(i)
         return out
 
-    peaks=extremes(hist,"peak"); troughs=extremes(hist,"trough")
-    results=[]
+    peaks   = extremes(hist, w=5, mode="peak")
+    troughs = extremes(hist, w=5, mode="trough")
+    results = []
 
-    if len(peaks)>=3:
-        p1,p2,p3=peaks[-3],peaks[-2],peaks[-1]
-        if(p3-p1>20 and hist[p1]<hist[p2]<hist[p3] and
-           high[p1]>high[p2]>high[p3] and hist[-1]>0 and
-           abs(hist[-1])<abs(hist[p3])*0.7 and hist[-1]<hist[-2]):
-            stop=float(high[p3])+atr*1.5
-            risk=max(stop-price,atr*0.5)
-            mark(cache,ck)
-            results.append({"score":9,"type":"₿","msg":(
+    if len(peaks) >= 3:
+        p1, p2, p3 = peaks[-3], peaks[-2], peaks[-1]
+        if (p3-p1 > 20 and hist[p1] < hist[p2] < hist[p3] and
+                high[p1] > high[p2] > high[p3] and hist[-1] > 0 and
+                abs(hist[-1]) < abs(hist[p3])*0.7 and hist[-1] < hist[-2]):
+            stop  = float(high[p3]) + atr*1.5; risk = max(stop - price, atr*0.5)
+            shares = calc_position(price, price + risk, "CRYPTO", None, pf)
+            mark(cache, ck)
+            results.append({"score": 9, "type": "₿", "msg": (
                 f"₿ 🔻 *[半木夏 空頭三背離]* `{disp}` 🏆 S級\n"
-                f"💰 現價:`{price:.2f}`\n"
-                f"📊 MACD三峰:`{hist[p1]:.4f}`→`{hist[p2]:.4f}`→`{hist[p3]:.4f}` ↑ (跨{p3-p1}根)\n"
-                f"📊 K線高點遞降\n"
-                f"🎯 做空:`{price:.2f}` 止損:`{stop:.2f}` 目標:`{price-risk*2:.2f}`\n"
-                f"⏰ {tw_time()} TWN")})
+                f"💰 現價:`{price:.4f}`\n"
+                f"📊 MACD三峰跨{p3-p1}根 · K線高點遞降\n"
+                f"🎯 做空:`{price:.4f}` 止損:`{stop:.4f}` 目標:`{price-risk*2:.4f}`\n"
+                + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
+                + f"⏰ {tw_time()} TWN")})
 
-    if len(troughs)>=3:
-        t1,t2,t3=troughs[-3],troughs[-2],troughs[-1]
-        if(t3-t1>20 and hist[t1]>hist[t2]>hist[t3] and
-           low[t1]<low[t2]<low[t3] and hist[-1]<0 and
-           abs(hist[-1])<abs(hist[t3])*0.7 and hist[-1]>hist[-2]):
-            stop=float(low[t3])-atr*1.5
-            risk=max(price-stop,atr*0.5)
-            mark(cache,ck)
-            results.append({"score":9,"type":"₿","msg":(
+    if len(troughs) >= 3:
+        t1, t2, t3 = troughs[-3], troughs[-2], troughs[-1]
+        if (t3-t1 > 20 and hist[t1] > hist[t2] > hist[t3] and
+                low[t1] < low[t2] < low[t3] and hist[-1] < 0 and
+                abs(hist[-1]) < abs(hist[t3])*0.7 and hist[-1] > hist[-2]):
+            stop   = float(low[t3]) - atr*1.5; risk = max(price - stop, atr*0.5)
+            shares = calc_position(price, stop, "CRYPTO", None, pf)
+            target = price + risk * 2
+            if shares > 0:
+                log_forward_test(disp, "CRYPTO", price, stop, target, shares)
+            mark(cache, ck)
+            results.append({"score": 9, "type": "₿", "msg": (
                 f"₿ 🚀 *[半木夏 多頭三背離]* `{disp}` 🏆 S級\n"
-                f"💰 現價:`{price:.2f}`\n"
-                f"📊 MACD三谷:`{hist[t1]:.4f}`→`{hist[t2]:.4f}`→`{hist[t3]:.4f}` ↓ (跨{t3-t1}根)\n"
-                f"📊 K線低點遞升\n"
-                f"🎯 做多:`{price:.2f}` 止損:`{stop:.2f}` 目標:`{price+risk*2:.2f}`\n"
-                f"⏰ {tw_time()} TWN")})
+                f"💰 現價:`{price:.4f}`\n"
+                f"📊 MACD三谷跨{t3-t1}根 · K線低點遞升\n"
+                f"🎯 做多:`{price:.4f}` 止損:`{stop:.4f}` 目標:`{target:.4f}`\n"
+                + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
+                + f"⏰ {tw_time()} TWN")})
 
     return results if results else None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 彙整報告
 # ══════════════════════════════════════════════════════════════════════════════
-def format_digest(sigs,label):
-    tw_now=_tw()
-    groups={
-        "⛈️風險":sorted([s for s in sigs if s["type"]=="⛈️"],key=lambda x:-x["score"]),
-        "⚡🔮🌅日內":sorted([s for s in sigs if s["type"] in ("⚡","🔮","🌅","⚠️")],key=lambda x:-x["score"]),
-        "🏦SMC":sorted([s for s in sigs if s["type"]=="🏦"],key=lambda x:-x["score"]),
-        "📈波段":sorted([s for s in sigs if s["type"]=="📈"],key=lambda x:-x["score"]),
-        "🎯VCP":sorted([s for s in sigs if s["type"]=="🎯"],key=lambda x:-x["score"]),
-        "₿加密":sorted([s for s in sigs if s["type"] in ("₿","📈") and
-                        ("BTC" in s["msg"] or "ETH" in s["msg"])],key=lambda x:-x["score"]),
+def format_digest(sigs, label, regime_on=True, strategy_stats=None):
+    tw_now = _tw()
+    groups = {
+        "⛈️風險":      sorted([s for s in sigs if s["type"]=="⛈️"],        key=lambda x:-x["score"]),
+        "⚡🔮🌅日內":  sorted([s for s in sigs if s["type"] in ("⚡","🔮","🌅","⚠️")], key=lambda x:-x["score"]),
+        "🏦SMC":       sorted([s for s in sigs if s["type"]=="🏦"],        key=lambda x:-x["score"]),
+        "📈波段":      sorted([s for s in sigs if s["type"]=="📈"],        key=lambda x:-x["score"]),
+        "🎯VCP":       sorted([s for s in sigs if s["type"]=="🎯"],        key=lambda x:-x["score"]),
+        "₿加密":       sorted([s for s in sigs if s["type"]=="₿"],        key=lambda x:-x["score"]),
     }
-    lines=[f"📋 *CC Scanner · {label}*",
-           f"⏰ {tw_now.strftime('%m/%d %H:%M')} TWN · 美股:{us_status()}",
-           f"Polygon:{'✓' if POLYGON_KEY else '✗'} SIP",""]
-    for grp,lst in groups.items():
+    regime_txt = "🟢多頭(QQQ>10MA)" if regime_on else "🔴空頭(一般股封印)"
+    lines = [
+        f"📋 *CC Scanner · {label}*",
+        f"⏰ {tw_now.strftime('%m/%d %H:%M')} TWN · 美股:{us_status()}",
+        f"大盤:{regime_txt} · Alpaca:{'✓' if ALPACA_KEY else '✗'} IEX",
+        f"風控: 總持倉≤{MAX_OPEN_POSITIONS} · 總風險≤{MAX_TOTAL_RISK*100:.0f}%",
+        ""
+    ]
+    if strategy_stats:
+        active = [s for s in strategy_stats.values() if s.sample_size >= 5]
+        if active:
+            lines.append("*策略統計*")
+            for st in active:
+                lines.append(f"• `{st.strategy}` {st.sample_size}筆 勝率:{st.winrate:.0%} 期望:{st.expectancy_r:.2f}R")
+            lines.append("")
+    for grp, lst in groups.items():
         if not lst: continue
         lines.append(f"*{grp} ({len(lst)}個)*")
         for s in lst[:6]:
-            first=s["msg"].split("\n")[0].replace("*","").replace("`","")
+            first = s["msg"].split("\n")[0].replace("*","").replace("`","")
             lines.append(f"• {first}")
         lines.append("")
     if not any(groups.values()):
         lines.append("本次無 S/A 級信號")
-    lines+=["━━━━━━━━━━━━━","S/A級開盤後即時 · ⛈️緊急即時"]
+    lines += ["━━━━━━━━━━━━━", "S/A級開盤後即時 · ⛈️緊急即時"]
     return "\n".join(lines)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📊 報表系統（v10.2 全掛載）
+# ══════════════════════════════════════════════════════════════════════════════
+def send_daily_report(all_sigs, fwd_data, stats):
+    """日報：美股收盤後 04:00-04:10 TWN"""
+    tw_now   = _tw(); today_str = tw_now.strftime("%Y-%m-%d")
+    today_fwd = [r for r in fwd_data if r.get("opened_at","").startswith(today_str)]
+    open_pos  = [r for r in fwd_data if r.get("status") == "OPEN"]
+    hit       = [r for r in fwd_data if r.get("status") == "TARGET_HIT"]
+    stopped   = [r for r in fwd_data if r.get("status") == "STOPPED"]
+    lines = [
+        f"📅 *CC Scanner 日報 {tw_now.strftime('%m/%d')}*",
+        f"今日發出信號: `{len(all_sigs)}` · 今日進場: `{len(today_fwd)}`",
+        f"持倉中:`{len(open_pos)}` · 達標:`{len(hit)}` · 止損:`{len(stopped)}`",
+    ]
+    if stats:
+        lines.append("")
+        for k, st in stats.items():
+            if st.sample_size >= 5:
+                lines.append(f"• `{k}` 勝率:{st.winrate:.0%} 期望:{st.expectancy_r:.2f}R")
+    send_tg("\n".join(lines))
+    print("日報已發送")
+
+def send_weekly_report(stats, bt_cache):
+    """週報：每週六 09:00 TWN"""
+    tw_now = _tw()
+    lines  = [f"📊 *CC Scanner 週報 {tw_now.strftime('%m/%d')}*", ""]
+    if stats:
+        for k, s in stats.items():
+            if s.sample_size >= 3:
+                lines.append(f"• `{k}` {s.sample_size}筆 勝率:{s.winrate:.0%} 期望:{s.expectancy_r:.2f}R")
+    if bt_cache:
+        lines += ["", "*歷史回測（近2年）*"]
+        for s, d in bt_cache.items():
+            lines.append(f"• `{s}` 勝率:{d['wr']:.0%} 期望:{d['exp']:.2f}R 樣本:{d['n']}")
+    if len(lines) > 2:
+        send_tg("\n".join(lines))
+        print("週報已發送")
+
+def send_monthly_report(fwd_data):
+    """月報：每月首週六"""
+    tw_now = _tw()
+    closed = [r for r in fwd_data if r.get("r_multiple") is not None]
+    if not closed: return
+    total_r  = sum(r["r_multiple"] for r in closed)
+    wins     = [r for r in closed if r["r_multiple"] > 0]
+    win_rate = len(wins) / len(closed)
+    lines = [
+        f"🏆 *CC Scanner 月報 ({tw_now.strftime('%Y-%m')})*",
+        f"結算比數: `{len(closed)}` · 勝率: `{win_rate:.0%}`",
+        f"累積R值: `{total_r:.2f}R`",
+        f"達標: `{len(wins)}` · 止損: `{len(closed)-len(wins)}`",
+    ]
+    send_tg("\n".join(lines))
+    print("月報已發送")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📊 週末回測引擎
+# ══════════════════════════════════════════════════════════════════════════════
+def run_weekend_backtest(cache):
+    print("[週末回測] 開始…")
+    results = {"SURGE": [], "WASHOUT": []}
+    test_syms = (TICKERS.get("🇺🇸",[])[:8] + TICKERS.get("🚀",[])[:6])
+    for sym in test_syms:
+        try:
+            df = _clean(yf.download(sym, period="2y", interval="1d", progress=False, auto_adjust=True))
+            if len(df) < 60: continue
+            df["Vol20"] = df["Volume"].rolling(20).mean()
+            df["Hi20"]  = df["High"].shift(1).rolling(20).max()
+            for i in range(25, len(df)-6):
+                c = df.iloc[i]
+                if pd.isna(c["Hi20"]) or pd.isna(c["Vol20"]): continue
+                vr = c["Volume"] / (c["Vol20"] + 1)
+                if c["Close"] > c["Hi20"] and vr > 1.5:
+                    entry = float(c["Close"]); stop = entry * 0.97; risk = entry - stop
+                    future = df.iloc[i+1:i+6]
+                    if float(future["Low"].min()) <= stop:
+                        results["SURGE"].append(-1.0)
+                    elif float(future["High"].max()) >= entry + risk*2:
+                        results["SURGE"].append(2.0)
+            for i in range(5, len(df)-4):
+                c = df.iloc[i]
+                day_open = float(c["Open"]); day_low = float(c["Low"])
+                drop = (day_open - day_low) / day_open * 100
+                if drop > 1.5 and c["Close"] >= day_open * 0.998:
+                    entry = float(c["Close"]); stop = day_low * 0.995
+                    risk  = max(entry - stop, entry * 0.005)
+                    future = df.iloc[i+1:i+4]
+                    if float(future["Low"].min()) <= stop:
+                        results["WASHOUT"].append(-1.0)
+                    elif float(future["High"].max()) >= entry + risk*2:
+                        results["WASHOUT"].append(2.0)
+        except Exception as e:
+            print(f"  回測{sym}: {e}")
+    bt_stats = {}
+    for strategy, rs in results.items():
+        if len(rs) < 10: continue
+        wins = [r for r in rs if r > 0]; n = len(rs)
+        bt_stats[strategy] = {"wr": round(len(wins)/n, 3), "exp": round(sum(rs)/n, 3), "n": n}
+        print(f"  {strategy}: {n}筆 勝率{len(wins)/n:.0%} 期望{sum(rs)/n:.2f}R")
+    cache["bt_stats"] = bt_stats
+    print("[週末回測] 完成")
+    return bt_stats
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 主程式
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    global _crash_warned,_trend_cache
-    _crash_warned=set(); _trend_cache={}
+    global _crash_warned, _trend_cache, _bt_stats_cache
+    _crash_warned = set(); _trend_cache = {}
 
-    mode=get_mode(); status=us_status(); cache=load_cache()
-    tw_now=_tw()
+    mode = get_mode(); status = us_status(); cache = load_cache()
+    tw_now = _tw()
     print(f"\n{'='*55}")
-    print(f"CC Scanner v8.6 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"CC Scanner v9.5 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
     print(f"美股:{status} | 模式:{mode}")
-    print(f"Alpaca:{'✓' if ALPACA_KEY else '✗'} (IEX即時) → yfinance(延遲)")
+    print(f"Alpaca:{'✓' if ALPACA_KEY else '✗'} · FMP:{'✓' if FMP_KEY else '✗'} · 帳戶:{ACCOUNT_BAL:,}")
+    print(f"風控: 最大持倉={MAX_OPEN_POSITIONS} · 最大總風險={MAX_TOTAL_RISK*100:.0f}%")
     print(f"{'='*55}")
 
-    if mode=="SILENT": print("靜默模式"); return
+    # ── 週日靜默 ────────────────────────────────────────────────────────────
+    if tw_now.weekday() == 6:
+        print("週日靜默模式"); return
 
-    all_sigs=[]
+    # ── 週六統計日（回測+週報+月報）─────────────────────────────────────────
+    if tw_now.weekday() == 5:
+        if tw_now.hour == 9 and tw_now.minute < 10:
+            settle_forward_tests()
+            fwd_data = load_fwd()
+            stats    = build_strategy_stats(fwd_data)
+            run_weekend_backtest(cache)
+            send_weekly_report(stats, cache.get("bt_stats", {}))
+            if tw_now.day <= 7:  # 每月首週六發月報
+                send_monthly_report(fwd_data)
+        print("週六統計日 · 不執行日內掃描"); return
+
+    if mode == "SILENT": print("靜默模式"); return
+
+    # 1. 結算（FIX2: 每小時一次，避免頻繁下載）
+    if cooled(cache, f"settle_open_{tw_now.strftime('%Y%m%d_%H')}", 55):
+        settle_forward_tests()
+        mark(cache, f"settle_open_{tw_now.strftime('%Y%m%d_%H')}")
+
+    # 2. 建立統計與投資組合狀態
+    fwd_data        = load_fwd()
+    strategy_stats  = build_strategy_stats(fwd_data)
+    pf              = analyze_portfolio(fwd_data)  # v10.2 核心
+
+    # 3. 載入週末回測快取
+    _bt_stats_cache = cache.get("bt_stats", {})
+    if _bt_stats_cache:
+        print(f"已載入回測快取: {list(_bt_stats_cache.keys())}")
+
+    # 4. 大盤濾網
+    regime_on  = get_market_regime(cache)
+    regime_txt = "🟢多頭" if regime_on else "🔴空頭(一般股封印)"
+    print(f"大盤:{regime_txt} | 開倉:{pf['open_count']}/{MAX_OPEN_POSITIONS} | 總風險:${pf['total_risk']:.0f}")
+
+    all_sigs = []
 
     # ── 美股日內 ──────────────────────────────────────────────────────────────
-    if status in ("PRE","OPEN") or mode=="DIGEST_PRE":
+    if status in ("PRE","OPEN") or mode == "DIGEST_PRE":
         for tag in ["🇺🇸","🛡️","⚛️","🚀"]:
-            for sym in TICKERS.get(tag,[]):
+            for sym in TICKERS.get(tag, []):
                 try:
-                    df1d=get_yf(sym,"1d","200d")
-                    if not passes_trend(sym,tag,df1d): continue
-                    df5,df15,src=get_consistent(sym)
+                    df1d = get_yf(sym, "1d", "200d")
+                    if not passes_trend(sym, tag, df1d): continue
+                    earn_warn = get_earn_warn(sym, cache)
+
+                    # 流動性過濾（非妖股）
+                    if tag not in VOLATILE_TAGS:
+                        lk = f"liq_{sym}"
+                        if cooled(cache, lk, 60*12):
+                            try:
+                                _dv = _clean(yf.download(sym, "1d", "10d", progress=False, auto_adjust=True))
+                                cache[f"liq_v_{sym}"] = float(_dv["Volume"].tail(5).mean()) if not _dv.empty else 1e9
+                                mark(cache, lk)
+                            except: cache[f"liq_v_{sym}"] = 1e9
+                        if cache.get(f"liq_v_{sym}", 1e9) < 500_000:
+                            print(f"  {sym}: 日均量不足50萬，跳過"); continue
+
+                    df5, df15, src = get_consistent(sym)
                     if df5.empty: continue
-                    r=sig_crash(sym,tag,df5,df15,cache)
+
+                    r = sig_crash(sym, tag, df5, df15, src, cache, earn_warn)
                     if r: all_sigs.append(r)
-                    r=sig_surge(sym,tag,df5,df15,src,cache)
+                    r = sig_surge(sym, tag, df5, df15, src, cache, regime_on, earn_warn,
+                                  strategy_stats.get("SURGE"), pf)
                     if r: all_sigs.append(r)
-                    r=sig_washout(sym,tag,df5,df15,status,cache)
+                    r = sig_washout(sym, tag, df5, df15, status, cache, earn_warn,
+                                    strategy_stats.get("WASHOUT"), pf)
                     if r: all_sigs.append(r)
-                    # SMC（用yfinance全市場量）
-                    df15f=get_yf(sym,"15m","5d")
+                    df15f = get_yf(sym, "15m", "5d")
                     if not df15f.empty and not df1d.empty:
-                        res=sig_smc(sym,tag,df15f,df1d,cache)
+                        res = sig_smc(sym, tag, df15f, df1d, cache, pf)
                         if res: all_sigs.extend(res)
                 except Exception as e: print(f"  {sym}: {e}")
 
-    # ── 盤前跳空（PRE時段）────────────────────────────────────────────────────
-    if status=="PRE":
-        pre_syms=list(set(
-            TICKERS.get("🚀",[])+TICKERS.get("⚛️",[])+
+    # ── 盤前跳空 ──────────────────────────────────────────────────────────────
+    if status == "PRE":
+        pre_syms = list(set(
+            TICKERS.get("🚀",[]) + TICKERS.get("⚛️",[]) +
             ["AEHR","AXTI","ACMR","KTOS","SERV","AAOI","RCAT",
-             "IONQ","RGTI","NVTS","APLD","SMR","OKLO","NNE"]))
+             "IONQ","RGTI","NVTS","APLD","SMR","OKLO","NNE"]
+        ))
         for sym in pre_syms:
-            tag="🚀" if sym in TICKERS.get("🚀",[]) else "⚛️" if sym in TICKERS.get("⚛️",[]) else "🚀"
+            tag = ("🚀" if sym in TICKERS.get("🚀",[]) else
+                   "⚛️" if sym in TICKERS.get("⚛️",[]) else "🚀")
             try:
-                r=sig_pregap(sym,tag,cache)
+                earn_warn = get_earn_warn(sym, cache)
+                r = sig_pregap(sym, tag, cache, earn_warn)
                 if r: all_sigs.append(r)
             except Exception as e: print(f"  盤前{sym}: {e}")
 
-    # ── 美股波段 + VCP ────────────────────────────────────────────────────────
-    if is_us_swing() or mode=="DIGEST_PRE":
+    # ── 美股波段 + VCP ─────────────────────────────────────────────────────
+    if is_us_swing() or mode == "DIGEST_PRE":
         for tag in ["🇺🇸","🛡️","🚀"]:
-            for sym in TICKERS.get(tag,[]):
+            for sym in TICKERS.get(tag, []):
                 try:
-                    df1d=get_yf(sym,"1d","200d")
-                    if not passes_trend(sym,tag,df1d): continue
-                    df5,_,_=get_consistent(sym)
+                    df1d = get_yf(sym, "1d", "200d")
+                    if not passes_trend(sym, tag, df1d): continue
+                    earn_warn = get_earn_warn(sym, cache)
+                    df5, _, _ = get_consistent(sym)
                     if not df1d.empty and not df5.empty:
-                        r=sig_pullback(sym,tag,df1d,df5,cache)
+                        r = sig_pullback(sym, tag, df1d, df5, cache, earn_warn, pf)
                         if r: all_sigs.append(r)
                 except Exception as e: print(f"  {sym}: {e}")
-        vcp=scan_vcp(VCP_WATCHLIST,cache)
+        vcp = scan_vcp(VCP_WATCHLIST, cache, strategy_stats.get("VCP"), pf)
         if vcp: all_sigs.extend(vcp)
 
-    # ── 台股（三層fallback）────────────────────────────────────────────────────
-    if is_tw_open() or mode=="DIGEST_TW":
+    # ── 台股 ───────────────────────────────────────────────────────────────
+    if is_tw_open() or mode == "DIGEST_TW":
         for sym in TICKERS["🇹🇼"]:
             try:
-                df5=get_tw_stable(sym)
-                df15=get_yf(sym,"15m","5d")
+                df5  = get_tw_stable(sym)
+                df15 = get_yf(sym, "15m", "5d")
                 if df5.empty: continue
-                r=sig_surge(sym,"🇹🇼",df5,df15,"yfinance",cache)
+                r = sig_surge(sym, "🇹🇼", df5, df15, "yfinance", cache, True, "", None, pf)
                 if r: all_sigs.append(r)
-                r=sig_washout(sym,"🇹🇼",df5,df15,"OPEN",cache)
+                r = sig_washout(sym, "🇹🇼", df5, df15, "OPEN", cache, "", None, pf)
                 if r: all_sigs.append(r)
             except Exception as e: print(f"  TW{sym}: {e}")
-    if is_tw_swing() or mode=="DIGEST_TW":
+    if is_tw_swing() or mode == "DIGEST_TW":
         for sym in TICKERS["🇹🇼"]:
             try:
-                df1d=get_yf(sym,"1d","200d"); df5=get_tw_stable(sym)
+                df1d = get_yf(sym, "1d", "200d"); df5 = get_tw_stable(sym)
                 if not df1d.empty and not df5.empty:
-                    r=sig_pullback(sym,"🇹🇼",df1d,df5,cache)
+                    r = sig_pullback(sym, "🇹🇼", df1d, df5, cache, "", pf)
                     if r: all_sigs.append(r)
             except Exception as e: print(f"  TW SWING{sym}: {e}")
 
-    # ── 加密（半木夏三背離，冷卻4h）──────────────────────────────────────────
-    for yf_sym,disp in TICKERS["₿"]:
+    # ── 加密（半木夏三背離）──────────────────────────────────────────────
+    for yf_sym, disp in TICKERS["₿"]:
         try:
-            df15=get_yf(yf_sym,"15m","60d")
+            df15 = get_yf(yf_sym, "15m", "60d")
             if not df15.empty:
-                res=sig_banmuxa(yf_sym,disp,df15,cache)
+                res = sig_banmuxa(yf_sym, disp, df15, cache, pf)
                 if res: all_sigs.extend(res)
         except Exception as e: print(f"  ₿{disp}: {e}")
 
     save_cache(cache)
-    all_sigs.sort(key=lambda x:x["score"],reverse=True)
+    all_sigs.sort(key=lambda x: x["score"], reverse=True)
     print(f"掃描完成:{len(all_sigs)}個信號 · 模式:{mode}")
+    for k, st in strategy_stats.items():
+        if st.sample_size >= 5:
+            print(f"  {k}: {st.sample_size}筆 勝率{st.winrate:.0%} 期望{st.expectancy_r:.2f}R")
 
-    # ── 發送 ──────────────────────────────────────────────────────────────────
-    if mode in ("DIGEST_PRE","DIGEST_TW"):
-        label="美股開盤前彙整 🇺🇸" if mode=="DIGEST_PRE" else "台股開盤前彙整 🇹🇼"
-        send_tg(format_digest(all_sigs,label))
+    # ── 發送 ─────────────────────────────────────────────────────────────
+    if mode in ("DIGEST_PRE", "DIGEST_TW"):
+        label = "美股開盤前彙整 🇺🇸" if mode == "DIGEST_PRE" else "台股開盤前彙整 🇹🇼"
+        send_tg(format_digest(all_sigs, label, regime_on, strategy_stats))
         for s in [x for x in all_sigs if "🏆" in x["msg"]][:3]:
             send_tg(s["msg"])
 
-    elif mode=="OPEN_MODE":
-        # ⛈️ 緊急立即發
-        for s in [x for x in all_sigs if x["type"]=="⛈️"]:
+    elif mode == "OPEN_MODE":
+        for s in [x for x in all_sigs if x["type"] == "⛈️"]:
             send_tg(s["msg"])
-        # S+A 級立即發
         for s in [x for x in all_sigs if "🏆" in x["msg"] or "🥇" in x["msg"]]:
             send_tg(s["msg"])
-        # 每30分鐘彙整
         if is_digest_30_window() and all_sigs:
-            send_tg(format_digest(all_sigs,f"開盤彙整 {_tw().strftime('%H:%M')}"))
+            send_tg(format_digest(all_sigs, f"開盤彙整 {tw_now.strftime('%H:%M')}", regime_on, strategy_stats))
+
+    # ── 日報（收盤後 04:00-04:10 TWN）───────────────────────────────────
+    if 240 <= tw_now.hour*60 + tw_now.minute <= 250:
+        send_daily_report(all_sigs, fwd_data, strategy_stats)
 
     print("掃描結束\n")
+
 
 if __name__ == "__main__":
     main()
