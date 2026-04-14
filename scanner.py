@@ -1,4 +1,3 @@
-Content is user-generated and unverified.
 """
 CC Market Scanner v9.8 — 最終整合版
 底本：v9.5（累積 v9.6/v9.7/v9.8 所有修正）
