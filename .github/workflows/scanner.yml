@@ -49,7 +49,7 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           ACCOUNT_BAL: ${{ secrets.ACCOUNT_BAL }}
           EXTRA_VCP: ${{ secrets.EXTRA_VCP }}
-        run: python scanner_v98.py
+        run: scanner.py
 
       - name: Save Multi-Cache
         uses: actions/cache/save@v4
