@@ -1,20 +1,24 @@
+Content is user-generated and unverified.
 """
-CC Market Scanner v9.6 — Patch Notes
-底本：v9.5
+CC Market Scanner v9.8 — 最終整合版
+底本：v9.5（累積 v9.6/v9.7/v9.8 所有修正）
 
-修正清單：
-1. [FIX] sig_crash：加入「日漲幅>0封印」+「必須先有明顯上漲才能觸發」防止盤前誤報
-2. [FIX] sig_surge：盤前(PRE)改用「昨收突破前高」作為基準，不依賴盤中 K 線數量
-3. [FIX] sig_surge：CRCL/CRDO 等非 CORE_BYPASS 薄流動性妖股加入豁免清單
-4. [FIX] get_consistent：PRE 狀態下若 Alpaca 資料不足 10 根，直接 fallback yfinance 日線估算
-5. [NEW] 瘦身發送邏輯（來自 Gemini 建議，完整整合）：
-   - DIGEST_PRE/DIGEST_TW：僅一張彙整表，絕不刷屏
-   - OPEN_MODE：⛈️ 僅限 S 級+持倉名單或妖股；🔮 僅限 S 級+IEX即時
-   - 每 30 分鐘一張盤中彙整
-6. [FIX] passes_trend：擴大 CORE_BYPASS，加入 CRDO/CRCL/VST/PLTR/COIN/MSTR
+修正清單（相對 v9.6）：
 
-只需將以下各 def 區塊整段取代 v9.5 對應函式即可。
-不需修改的函式均未列出。
+Bug A：vol_surge 旁路繞過最低量能門檻
+  → KTOS 量比 0.3x 仍發 S 級根本原因
+  → 修正：vol_surge 成立還需滿足「recent_vol > IEX日線基準×0.5」
+    否則即使相對倍數高，絕對量能太低不算真放量
+
+Bug B：同一信號重複推送（OKLO 02:40 兩則一樣）
+  → GitHub Actions 每次新進程，mark() 後 cache 未即時落盤
+  → 修正：sig_surge/sig_crash 觸發後立即呼叫 save_cache(cache)
+    並將 sig_id 精度改為 %Y%m%d_%H%M（5分鐘去重），在 log_forward_test 入口就攔截
+
+Bug C：暴跌後仍觸發暴漲（OKLO 跌完再漲推送）
+  → _crash_warned 是 in-memory set，進程結束就清空
+  → 修正：crash 發生時同時在 cache 寫入 crash_seal_{sym}，
+    sig_surge 開頭檢查 crash_seal，60 分鐘內封印該股所有 SURGE 信號
 """
 
 import requests
@@ -282,8 +286,9 @@ def is_us_swing():
 
 def get_mode():
     tw = _tw(); m = tw.hour*60 + tw.minute; st = us_status()
-    if 1275 <= m < 1290: return "DIGEST_PRE"
-    if 480 <= m < 540:   return "DIGEST_TW"
+    if 1275 <= m < 1290: return "DIGEST_PRE"       # 21:15-21:30 TWN 美股盤前
+    if 480 <= m < 540:   return "DIGEST_TW_PRE"    # 08:00-09:00 TWN 台股盤前
+    if 810 <= m < 840:   return "DIGEST_TW_CLOSE"  # 13:30-14:00 TWN 台股收盤
     if st in ("PRE","OPEN") or is_tw_open(): return "OPEN_MODE"
     return "SILENT"
 
@@ -605,29 +610,46 @@ def sig_crash(sym, tag, df5, df15, source, cache, earn_warn=""):
     if pd.isna(c["VMA"]) or c["VMA"] < 10: return None
 
     vr = float(df["VR_Adj"].iloc[-1]) if "VR_Adj" in df.columns else c["Volume"] / (c["VMA"] + 1)
-    sup = df["Low"].tail(6).iloc[:-1].min()
     smc = detect_smc(df15)
     is_rocket = any(t in tag for t in VOLATILE_TAGS)
     status = us_status()
 
-    # [v9.6 FIX] 「先漲後跌」保護：日內最高需高於開盤至少 1.5%
+    # 「先漲後跌」保護：日內最高需高於開盤至少 1.5%
     day_open = get_day_open(df)
-    if day_open is not None:
-        day_high = float(df["High"].max())
-        had_rally = (day_high - day_open) / day_open * 100 >= 1.5
-        if not had_rally: return None  # 沒有漲過，不算暴跌預兆
+    if day_open is None: return None
+    day_high = float(df["High"].max())
+    day_chg  = (day_high - day_open) / day_open * 100
+    if day_chg < 1.5: return None
 
-    # [v9.6 FIX] 盤前時段提高量能門檻（薄流動性保護）
-    vr_thresh = 2.5 if status == "PRE" else (1.25 if is_rocket else 2.0)
+    # [v9.8 FIX] 強勢股保護：日內已漲 >8% 時大幅提高標準
+    # 強勢上漲日的正常回調不應觸發暴跌（CRDO 108->135->119 誤觸根本原因）
+    is_strong_day = day_chg >= 8.0
+    if is_strong_day:
+        # 支撐改看 15 根（75 分鐘），而非 6 根（30 分鐘）
+        sup = df["Low"].tail(15).iloc[:-1].min()
+        # 量能門檻大幅提高
+        vr_thresh = 4.0
+        # RSI 上限放寬（強勢股高 RSI 正常）
+        rsi_limit = 80
+    else:
+        sup = df["Low"].tail(6).iloc[:-1].min()
+        # 盤前時段提高量能門檻
+        vr_thresh = 2.5 if status == "PRE" else (1.25 if is_rocket else 2.0)
+        rsi_limit = 65
 
     c1 = c["Close"] < sup
     c2 = vr > vr_thresh
     c3 = c["Close"] < c["Open"]
-    c4 = c["RSI"] < p["RSI"] and c["RSI"] < 65
+    c4 = c["RSI"] < p["RSI"] and c["RSI"] < rsi_limit
     sc = sum([c1,c2,c3,c4]); g = grade(sc, 4)
     if not g or not (c1 and c2): return None
 
-    mark(cache, ck); _crash_warned.add(sym)
+    mark(cache, ck)
+    _crash_warned.add(sym)
+    # [v9.7 Bug C] 持久化封印：60 分鐘內跨進程阻止該股 SURGE 信號
+    mark(cache, f"crash_seal_{sym}")
+    save_cache(cache)  # 即時落盤，下一個 Actions 進程讀到封印
+
     chg = (c["Close"] - df.iloc[0]["Open"]) / df.iloc[0]["Open"] * 100
     return {"score": sc+10, "type": "⛈️", "msg": fmt_msg(
         tag, "⛈️", "暴跌預兆", sym, g, c["Close"], chg, vr, c["RSI"], smc,
@@ -644,6 +666,13 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
     if source in ("none","",None): return None
     ck = f"surge_{sym}"
     if not cooled(cache, ck, 30) or len(df5) < 5 or len(df15) < 3: return None
+
+    # [v9.7 Bug C] 暴跌封印：crash 發生後 60 分鐘內封印 SURGE（持久化到 cache，跨進程有效）
+    seal_key = f"crash_seal_{sym}"
+    if not cooled(cache, seal_key, 60):
+        print(f"  {sym}: crash_seal 封印中，跳過 SURGE")
+        return None
+
     df = add_atr(add_rsi(add_sma(df5, "Volume", 15, "VMA")))
     c = df.iloc[-1]; p = df.iloc[-2]
     is_rocket = any(t in tag for t in VOLATILE_TAGS)
@@ -671,8 +700,24 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
     if not vol_ok and is_rocket and len(df) >= 10:
         recent_vol = df["Volume"].tail(5).mean()
         older_vol  = df["Volume"].iloc[max(-len(df),-15):-5].mean() or 1
-        vol_surge  = recent_vol > older_vol * 2.0
-        if vol_surge: vol_ok = True
+        rel_surge  = recent_vol > older_vol * 2.0
+
+        # [v9.7 Bug A] vol_surge 需同時滿足絕對量能下限
+        # 日線5日均量 ÷ 78根 × IEX比例(2.5%) × 0.5 = 每根最低基準的一半
+        # 防止「相對倍數高但絕對量極低（如 vr=0.3x）」的假放量穿透
+        abs_floor = 0.0
+        try:
+            df1d_chk = _clean(yf.download(sym, interval="1d", period="10d",
+                                           progress=False, auto_adjust=True))
+            if not df1d_chk.empty:
+                daily_avg = float(df1d_chk["Volume"].tail(5).mean())
+                abs_floor = (daily_avg / 78) * 0.025 * 0.5
+        except:
+            pass
+
+        vol_surge = rel_surge and (recent_vol >= abs_floor)
+        if vol_surge:
+            vol_ok = True
 
     # [v9.6 FIX] 盤前模式：改用「昨日收盤前 N 根的高點」作為突破基準
     # 避免盤前 K 線不足導致 prev_hi 等於當根高點
@@ -1009,60 +1054,227 @@ def scan_vcp(ticker_list, cache, stats=None, pf=None):
         except Exception as e: print(f"  VCP {sym}: {e}")
     return results
 
+def _bmx_get_funding(disp_sym):
+    """
+    直接呼叫 Binance REST，不依賴全域 client。
+    失敗回傳 None（呼叫方自行決定是否加分）。
+    BTC/USDT -> BTCUSDT；ETH-BTC -> ETHBTC（特殊對）
+    """
+    import re as _re
+    s = str(disp_sym).strip().upper()
+    compact = _re.sub(r"[/:\-\s]", "", s)
+    # ETH/BTC 對：取 ETH funding - BTC funding 的差值
+    is_ethbtc = (compact == "ETHBTC")
+    syms = ["ETHUSDT", "BTCUSDT"] if is_ethbtc else [compact if compact.endswith("USDT") else compact + "USDT"]
+    vals = []
+    for sym in syms:
+        try:
+            r = requests.get(
+                "https://fapi.binance.com/fapi/v1/fundingRate",
+                params={"symbol": sym, "limit": 3},
+                timeout=5
+            )
+            if r.status_code == 200:
+                rates = [float(x["fundingRate"]) for x in r.json() if "fundingRate" in x]
+                if rates:
+                    vals.append(float(np.mean(rates)))
+        except Exception:
+            pass
+    if is_ethbtc and len(vals) == 2:
+        return vals[0] - vals[1]   # ETH funding - BTC funding
+    return vals[0] if vals else None
+
+
+def _bmx_trend_break(df, price, w=14, mode="bull"):
+    """
+    趨勢線突破（多）/ 跌破（空）
+    mode="bull"：找兩個 pivot high，當前收盤突破下降壓力線
+    mode="bear"：找兩個 pivot low，當前收盤跌破上升支撐線
+    回傳 (is_break: bool, slope_per_bar: float)
+    """
+    if len(df) < w * 2 + 5:
+        return False, 0.0
+    try:
+        if mode == "bull":
+            pts = df["High"].to_numpy(dtype=float)
+        else:
+            pts = df["Low"].to_numpy(dtype=float)
+
+        pivot_idx = []
+        for i in range(len(df) - w - 1, w, -1):
+            seg = pts[i - w: i + w + 1]
+            if mode == "bull" and pts[i] == seg.max(): pivot_idx.append(i)
+            if mode == "bear" and pts[i] == seg.min(): pivot_idx.append(i)
+            if len(pivot_idx) == 2: break
+
+        if len(pivot_idx) < 2: return False, 0.0
+        left, right = sorted(pivot_idx)
+        if right <= left: return False, 0.0
+
+        lv, rv = pts[left], pts[right]
+        if lv <= 0: return False, 0.0
+        slope = (rv - lv) / (right - left)
+        intercept = rv - slope * right
+        p_slope = slope / lv  # 每根百分比斜率
+
+        # 中段失效：中間K線不能已穿越壓力/支撐（允許 0.2% 誤差）
+        closes = df["Close"].to_numpy(dtype=float)
+        for i in range(left, right):
+            line_val = slope * i + intercept
+            if mode == "bull" and closes[i] > line_val * 1.002: return False, 0.0
+            if mode == "bear" and closes[i] < line_val * 0.998: return False, 0.0
+
+        curr_line = slope * (len(df) - 1) + intercept
+        if mode == "bull":
+            is_break = price > curr_line and p_slope < -0.0001 and p_slope > -0.05
+        else:
+            is_break = price < curr_line and p_slope > 0.0001 and p_slope < 0.05
+        return is_break, p_slope
+    except Exception:
+        return False, 0.0
+
+
 def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
+    """
+    半木夏 Pro v9.8：MACD 三背離 + 趨勢線突破 + Funding 情緒加分
+    修正自 sig_banmuxa_pro：
+    - B1: funding 改用 Binance REST，不依賴全域 client
+    - B2: 保留空頭三峰方向
+    - B3: calc_position 補 pf 參數
+    - B4: log_forward_test 補 shares 參數
+    - B5: funding_cache 改用獨立 key 前綴，不存 tuple（改存 dict）
+    - B6: 冷卻改回 120 分鐘（背離結構不可能 15 分鐘換）
+    新增改進：
+    - 空頭也加趨勢線跌破條件
+    - 谷點/峰點間距 >= 5 根防偽谷
+    - 新鮮度檢查：最後谷/峰距今 <= 15 根
+    """
     ck = f"bmx_{disp}"
-    if not cooled(cache, ck, 240) or len(df15) < 120: return None
+    if not cooled(cache, ck, 120) or len(df15) < 120: return None
+
     df   = add_atr(add_macd(df15.copy()))
-    hist = df["MACD_hist"].values; high = df["High"].values; low = df["Low"].values
-    c    = df.iloc[-1]; atr = float(c["ATR"]) if not pd.isna(c["ATR"]) else 0
-    price = float(c["Close"])
+    if len(df) < 120: return None
 
-    def extremes(arr, w=5, mode="peak"):
-        out = []
-        for i in range(w, len(arr)-w):
-            seg = arr[i-w:i+w+1]
-            if mode == "peak"   and arr[i] == max(seg) and arr[i] > 0: out.append(i)
-            if mode == "trough" and arr[i] == min(seg) and arr[i] < 0: out.append(i)
-        return out
+    try:
+        price = float(df["Close"].iloc[-1])
+    except Exception: return None
+    if not np.isfinite(price) or price <= 0: return None
 
-    peaks   = extremes(hist, w=5, mode="peak")
-    troughs = extremes(hist, w=5, mode="trough")
+    atr_raw = df["ATR"].iloc[-1]
+    atr = float(atr_raw) if pd.notna(atr_raw) and np.isfinite(atr_raw) and float(atr_raw) > 0 else price * 0.005
+    risk_floor = price * 0.003
+
+    hist = df["MACD_hist"].to_numpy(dtype=float)
+    high = df["High"].to_numpy(dtype=float)
+    low  = df["Low"].to_numpy(dtype=float)
+
     results = []
+    is_ethbtc = str(disp).upper().replace("/","").replace("-","") == "ETHBTC"
 
-    if len(peaks) >= 3:
-        p1, p2, p3 = peaks[-3], peaks[-2], peaks[-1]
-        if (p3-p1 > 20 and hist[p1] < hist[p2] < hist[p3] and
-                high[p1] > high[p2] > high[p3] and hist[-1] > 0 and
-                abs(hist[-1]) < abs(hist[p3])*0.7 and hist[-1] < hist[-2]):
-            stop  = float(high[p3]) + atr*1.5; risk = max(stop - price, atr*0.5)
-            shares = calc_position(price, price + risk, "CRYPTO", None, pf)
-            mark(cache, ck)
-            results.append({"score": 9, "type": "₿", "msg": (
-                f"₿ 🔻 *[半木夏 空頭三背離]* `{disp}` 🏆 S級\n"
-                f"💰 現價:`{price:.4f}`\n"
-                f"📊 MACD三峰跨{p3-p1}根 · K線高點遞降\n"
-                f"🎯 做空:`{price:.4f}` 止損:`{stop:.4f}` 目標:`{price-risk*2:.4f}`\n"
-                + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
-                + f"⏰ {tw_time()} TWN")})
+    # ── Funding（一次取，多空共用）─────────────────────────────────────────
+    # 用 cache 儲存，key 格式為純字串，避免 tuple 序列化問題（B5 fix）
+    f_cache_key = f"bmx_funding_{disp}"
+    f_cache_ts_key = f"bmx_funding_ts_{disp}"
+    now_utc = datetime.utcnow().timestamp()
+    f_val = None
+    if f_cache_ts_key in cache:
+        try:
+            if now_utc - float(cache[f_cache_ts_key]) < 3600:
+                raw = cache.get(f_cache_key)
+                f_val = float(raw) if raw is not None else None
+        except Exception: pass
+    if f_val is None:
+        f_val = _bmx_get_funding(disp)
+        cache[f_cache_key]    = str(f_val) if f_val is not None else ""
+        cache[f_cache_ts_key] = str(now_utc)
 
-    if len(troughs) >= 3:
-        t1, t2, t3 = troughs[-3], troughs[-2], troughs[-1]
-        if (t3-t1 > 20 and hist[t1] > hist[t2] > hist[t3] and
-                low[t1] < low[t2] < low[t3] and hist[-1] < 0 and
-                abs(hist[-1]) < abs(hist[t3])*0.7 and hist[-1] > hist[-2]):
-            stop   = float(low[t3]) - atr*1.5; risk = max(price - stop, atr*0.5)
-            shares = calc_position(price, stop, "CRYPTO", None, pf)
-            target = price + risk * 2
-            if shares > 0:
-                log_forward_test(disp, "CRYPTO", price, stop, target, shares)
-            mark(cache, ck)
-            results.append({"score": 9, "type": "₿", "msg": (
-                f"₿ 🚀 *[半木夏 多頭三背離]* `{disp}` 🏆 S級\n"
-                f"💰 現價:`{price:.4f}`\n"
-                f"📊 MACD三谷跨{t3-t1}根 · K線低點遞升\n"
-                f"🎯 做多:`{price:.4f}` 止損:`{stop:.4f}` 目標:`{target:.4f}`\n"
-                + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
-                + f"⏰ {tw_time()} TWN")})
+    def funding_grade(fv, direction):
+        """多頭：負 funding = 空頭付費給多頭 = 燃料充足；空頭反之"""
+        if fv is None: return "中性", 0
+        if direction == "bull": return ("燃料充足🔥", 1) if fv < 0 else ("中性", 0)
+        else: return ("多頭擁擠🔥", 1) if fv > 0.0003 else ("中性", 0)
+
+    # ── 多頭三背離 ─────────────────────────────────────────────────────────
+    raw_troughs = [
+        i for i in range(10, len(hist)-10)
+        if np.isfinite(hist[i]) and hist[i] < 0
+        and hist[i] == np.min(hist[i-10:i+11])
+    ]
+    if len(raw_troughs) >= 3:
+        t1, t2, t3 = raw_troughs[-3], raw_troughs[-2], raw_troughs[-1]
+        spacing_ok = (t3-t2 >= 5) and (t2-t1 >= 5)          # [Pro] 間距保護
+        fresh_ok   = (len(hist)-1-t3) <= 15                   # [Pro] 新鮮度
+        div_ok = (
+            spacing_ok and fresh_ok
+            and (t3-t1 > 20)
+            and hist[t1] > hist[t2] > hist[t3]               # MACD 谷遞深
+            and low[t1] < low[t2] < low[t3]                  # 價格低點遞升
+            and hist[-1] > hist[-2]                           # 當前 hist 勾頭
+        )
+        if div_ok:
+            w_break = 24 if is_ethbtc else 14
+            is_break, p_slope = _bmx_trend_break(df, price, w=w_break, mode="bull")
+            if is_break:
+                raw_stop = float(low[t3]) - atr * 1.5
+                stop     = min(raw_stop, price - risk_floor)
+                if np.isfinite(stop) and 0 < stop < price:
+                    risk   = price - stop
+                    target = price + risk * 2
+                    shares = calc_position(price, stop, "CRYPTO", None, pf)  # B3 fix
+                    if shares > 0:
+                        log_forward_test(disp, "CRYPTO", price, stop, target, shares)  # B4 fix
+                    mark(cache, ck)
+                    f_text, f_bonus = funding_grade(f_val, "bull")
+                    score  = 10 if f_bonus else 9
+                    grade_lbl = "🌟 SSS" if f_bonus else "🏆 S級"
+                    f_str = f"{f_val*100:.4f}%" if f_val is not None else "N/A"
+                    results.append({"score": score, "type": "₿", "msg": (
+                        f"₿ 🚀 *[半木夏 Pro 多頭]* `{disp}` {grade_lbl}\n"
+                        f"💰 現價:`{price:.4f}`\n"
+                        f"📊 MACD三谷跨{t3-t1}根 · 低點遞升 · 壓力線突破\n"
+                        f"📐 趨勢斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
+                        f"🎯 止損:`{stop:.4f}` 目標:`{target:.4f}` (1:2)\n"
+                        + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
+                        + f"⏰ {tw_time()} TWN")})
+
+    # ── 空頭三背離（保留原版方向，B2 fix）─────────────────────────────────
+    raw_peaks = [
+        i for i in range(10, len(hist)-10)
+        if np.isfinite(hist[i]) and hist[i] > 0
+        and hist[i] == np.max(hist[i-10:i+11])
+    ]
+    if len(raw_peaks) >= 3:
+        p1, p2, p3 = raw_peaks[-3], raw_peaks[-2], raw_peaks[-1]
+        spacing_ok = (p3-p2 >= 5) and (p2-p1 >= 5)
+        fresh_ok   = (len(hist)-1-p3) <= 15
+        div_ok = (
+            spacing_ok and fresh_ok
+            and (p3-p1 > 20)
+            and hist[p1] < hist[p2] < hist[p3]               # MACD 峰遞高（頂背離）
+            and high[p1] > high[p2] > high[p3]               # 價格高點遞降
+            and hist[-1] < hist[-2]                           # 當前 hist 轉頭向下
+        )
+        if div_ok:
+            is_break, p_slope = _bmx_trend_break(df, price, w=14, mode="bear")
+            if is_break:
+                raw_stop = float(high[p3]) + atr * 1.5
+                stop     = max(raw_stop, price + risk_floor)
+                if np.isfinite(stop) and stop > price:
+                    risk   = stop - price
+                    target = price - risk * 2
+                    shares = calc_position(price, price + risk, "CRYPTO", None, pf)
+                    mark(cache, ck)
+                    f_text, f_bonus = funding_grade(f_val, "bear")
+                    score  = 10 if f_bonus else 9
+                    grade_lbl = "🌟 SSS" if f_bonus else "🏆 S級"
+                    f_str = f"{f_val*100:.4f}%" if f_val is not None else "N/A"
+                    results.append({"score": score, "type": "₿", "msg": (
+                        f"₿ 🔻 *[半木夏 Pro 空頭]* `{disp}` {grade_lbl}\n"
+                        f"💰 現價:`{price:.4f}`\n"
+                        f"📊 MACD三峰跨{p3-p1}根 · 高點遞降 · 支撐線跌破\n"
+                        f"📐 趨勢斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
+                        f"🎯 止損:`{stop:.4f}` 目標:`{target:.4f}` (1:2)\n"
+                        + f"⏰ {tw_time()} TWN")})
 
     return results if results else None
 
@@ -1199,7 +1411,7 @@ def run_weekend_backtest(cache):
     return bt_stats
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [v9.6 整合] 主程式
+# ── 主程式 ──
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     global _crash_warned, _trend_cache, _bt_stats_cache
@@ -1207,8 +1419,19 @@ def main():
 
     mode = get_mode(); status = us_status(); cache = load_cache()
     tw_now = _tw()
+
+    # [v9.8 FIX] 跨日清除 crash_seal：昨天的封印不應影響今天的 SURGE
+    today_str = tw_now.strftime("%Y-%m-%d")
+    seal_date_key = "crash_seal_date"
+    if cache.get(seal_date_key) != today_str:
+        # 新的一天，清除所有 crash_seal_* 鍵
+        stale_keys = [k for k in list(cache.keys()) if k.startswith("crash_seal_")]
+        for k in stale_keys:
+            del cache[k]
+        cache[seal_date_key] = today_str
+        print(f"跨日清除 {len(stale_keys)} 個 crash_seal")
     print(f"\n{'='*55}")
-    print(f"CC Scanner v9.6 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"CC Scanner v9.8 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
     print(f"美股:{status} | 模式:{mode}")
     print(f"Alpaca:{'✓' if ALPACA_KEY else '✗'} · FMP:{'✓' if FMP_KEY else '✗'} · 帳戶:{ACCOUNT_BAL:,}")
     print(f"風控: 最大持倉={MAX_OPEN_POSITIONS} · 最大總風險={MAX_TOTAL_RISK*100:.0f}%")
@@ -1285,16 +1508,16 @@ def main():
                         if res: all_sigs.extend(res)
                 except Exception as e: print(f"  {sym}: {e}")
 
-    # ── 盤前跳空 ──────────────────────────────────────────────────────────────
+    # ── 盤前跳空（覆蓋所有 tag）────────────────────────────────────────────
     if status == "PRE":
-        pre_syms = list(set(
-            TICKERS.get("🚀",[]) + TICKERS.get("⚛️",[]) +
-            ["AEHR","AXTI","ACMR","KTOS","SERV","AAOI","RCAT",
-             "IONQ","RGTI","NVTS","APLD","SMR","OKLO","NNE"]
-        ))
-        for sym in pre_syms:
-            tag = ("🚀" if sym in TICKERS.get("🚀",[]) else
-                   "⚛️" if sym in TICKERS.get("⚛️",[]) else "🚀")
+        # [v9.8] 全名單掃盤前跳空：US/Shield/Rocket/Nuclear 全部納入
+        # 建立 sym->tag 映射，後加的不覆蓋先加的
+        sym_tag_map = {}
+        for _t in ["🇺🇸", "🛡️", "⚛️", "🚀"]:
+            for _s in TICKERS.get(_t, []):
+                if _s not in sym_tag_map:
+                    sym_tag_map[_s] = _t
+        for sym, tag in sym_tag_map.items():
             try:
                 earn_warn = get_earn_warn(sym, cache)
                 r = sig_pregap(sym, tag, cache, earn_warn)
@@ -1318,7 +1541,7 @@ def main():
         if vcp: all_sigs.extend(vcp)
 
     # ── 台股 ──────────────────────────────────────────────────────────────────
-    if is_tw_open() or mode == "DIGEST_TW":
+    if is_tw_open() or mode in ("DIGEST_TW_PRE", "DIGEST_TW_CLOSE"):
         for sym in TICKERS["🇹🇼"]:
             try:
                 df5  = get_tw_stable(sym)
@@ -1329,7 +1552,7 @@ def main():
                 r = sig_washout(sym, "🇹🇼", df5, df15, "OPEN", cache, "", None, pf)
                 if r: all_sigs.append(r)
             except Exception as e: print(f"  TW{sym}: {e}")
-    if is_tw_swing() or mode == "DIGEST_TW":
+    if is_tw_swing() or mode in ("DIGEST_TW_PRE", "DIGEST_TW_CLOSE"):
         for sym in TICKERS["🇹🇼"]:
             try:
                 df1d = get_yf(sym, "1d", "200d"); df5 = get_tw_stable(sym)
@@ -1349,6 +1572,17 @@ def main():
 
     save_cache(cache)
     all_sigs.sort(key=lambda x: x["score"], reverse=True)
+    # [v9.7 Bug B] 去重：同一支股票同類型信號只保留最高分那一則
+    seen_sig_keys = set()
+    deduped = []
+    for s in all_sigs:
+        # 取 "type+第一行前30字" 作為去重鍵
+        first_line = s["msg"].split("\n")[0][:40]
+        key = f"{s['type']}|{first_line}"
+        if key not in seen_sig_keys:
+            seen_sig_keys.add(key)
+            deduped.append(s)
+    all_sigs = deduped
     print(f"掃描完成:{len(all_sigs)}個信號 · 模式:{mode}")
     for k, st in strategy_stats.items():
         if st.sample_size >= 5:
@@ -1357,12 +1591,23 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # [v9.6 瘦身發送邏輯]
     # ══════════════════════════════════════════════════════════════════════════
-    if mode in ("DIGEST_PRE", "DIGEST_TW"):
-        # 彙整模式：只發一張大表，絕不刷屏
-        label = "美股盤前彙整 🇺🇸" if mode == "DIGEST_PRE" else "台股收盤彙整 🇹🇼"
-        digest_msg = format_digest(all_sigs, label, regime_on, strategy_stats)
-        send_tg(digest_msg)
-        print(f"已發送彙整報表，包含 {len(all_sigs)} 個信號。")
+    if mode in ("DIGEST_PRE", "DIGEST_TW_PRE", "DIGEST_TW_CLOSE"):
+        # 彙整模式：每個 mode 每天只發一次，用 cache 冷卻防重複
+        digest_ck = f"digest_{mode}_{tw_now.strftime('%Y%m%d')}"
+        if not cooled(cache, digest_ck, 55):
+            print(f"彙整已發送過（{mode}），跳過")
+        else:
+            label_map = {
+                "DIGEST_PRE":       "美股盤前彙整 🇺🇸",
+                "DIGEST_TW_PRE":    "台股盤前彙整 🇹🇼",
+                "DIGEST_TW_CLOSE":  "台股收盤彙整 🇹🇼",
+            }
+            label = label_map[mode]
+            digest_msg = format_digest(all_sigs, label, regime_on, strategy_stats)
+            send_tg(digest_msg)
+            mark(cache, digest_ck)
+            save_cache(cache)
+            print(f"已發送彙整報表（{label}），包含 {len(all_sigs)} 個信號。")
 
     elif mode == "OPEN_MODE":
         # 1. 暴跌：僅 S 級 + (持倉名單 OR 妖股標籤)
