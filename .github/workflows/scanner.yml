@@ -1,4 +1,4 @@
-name: CC Market Scanner v9.5
+name: CC Market Scanner v9.8
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # 放寬時間以應付 v9.5 的複雜運算
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -22,14 +22,13 @@ jobs:
       - name: Restore Multi-Cache (Cooling + Forward Test)
         uses: actions/cache/restore@v4
         with:
-          # 關鍵：同時緩存冷卻 JSON 和 交易日誌 JSON
           path: |
             /tmp/cc_cache.json
             /tmp/cc_forward_log.json
-          key: cc-scanner-v9.5-data-${{ github.run_id }}
+          key: cc-scanner-v9.8-data-${{ github.run_id }}
           restore-keys: |
+            cc-scanner-v9.8-data-
             cc-scanner-v9.5-data-
-            cc-scanner-cache-
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -50,8 +49,7 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           ACCOUNT_BAL: ${{ secrets.ACCOUNT_BAL }}
           EXTRA_VCP: ${{ secrets.EXTRA_VCP }}
-        # 確保你的 python 檔名是 scanner.py，或者改為你實際的檔名
-        run: python scanner.py
+        run: python scanner_v98.py
 
       - name: Save Multi-Cache
         uses: actions/cache/save@v4
@@ -60,4 +58,4 @@ jobs:
           path: |
             /tmp/cc_cache.json
             /tmp/cc_forward_log.json
-          key: cc-scanner-v9.5-data-${{ github.run_id }}
+          key: cc-scanner-v9.8-data-${{ github.run_id }}
