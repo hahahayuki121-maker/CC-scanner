@@ -69,7 +69,7 @@ TICKERS = {
              "AAPL","META","MSFT","GOOGL","PLTR","QQQ"],
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
-    "🚀": ["CRCL","COIN","MSTR","MARA","CLSK","HOOD","SOFI",
+    "🚀": ["CRCL","COIN","MSTR","BMNR","MARA","CLSK","HOOD","SOFI",
             "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS",
             "AXTI","AEHR","ACMR","KTOS","SERV","CRDO","ALAB","INTC","ASX"],
     "🇹🇼": ["2330.TW","00631L.TW","3324.TW","3017.TW","2308.TW","3711.TW"],
