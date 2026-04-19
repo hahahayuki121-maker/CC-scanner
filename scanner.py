@@ -1,43 +1,27 @@
 """
-CC Market Scanner v9.8.3 — 統合修正版
-底本：v9.8.2
+CC Market Scanner v9.8.6 — 結算修正 + 倉位保守版
+底本：v9.8.5
 
-相對 v9.8.2 的全部修正與改動：
+【v9.8.6 修正清單】
 
-【BUG-FIX-1】sig_crash 重複定義問題
-  - 移除第一個不完整的 sig_crash（缺少 mark/crash_seal 寫入邏輯）
-  - 保留第二個完整版本（含 last_type_{sym} 標記）
+[FIX-A] settle_forward_tests：全路徑結算（修復「只看最後一秒價格」白內障問題）
+  問題：原版只用 df["Close"].iloc[-1] 當退出價，
+        若 Stop 或 Target 在中途已被觸及，結算價格完全失真。
+  修正：改用 5m K 線的 period_low / period_high 判斷路徑，
+        先碰停損 → STOPPED @ stop price，先碰目標 → TARGET_HIT @ target price。
+  注意：同一根 K 棒同時穿越停損與目標時，仍以停損優先（保守原則）。
 
-【FEAT-NEW-1】is_toxic_premarket_time() 低流動性時間屏蔽
-  - 美東時間 04:00~04:15（台灣 16:00~16:15）屏蔽所有日內訊號
-  - 盤前跳空 (sig_pregap) 豁免：該策略設計本就針對盤前，但延後到 04:15 後發送
-  - 加密與台股不受影響（非美股盤前）
-  - 不會影響每 30 分鐘彙整邏輯
+[FIX-B] calc_position：關閉日線回測放大倉位段（_bt_stats_cache 路徑）
+  問題：run_weekend_backtest 以日線粗算，SURGE 勝率 23% / 期望 -0.30R，
+        WASHOUT 勝率 26% / 期望 -0.20R，但程式仍在 bt["wr"]>=0.55 時放大。
+        實際上此條件永遠不成立，但負期望段（bt["exp"]<0.0）卻會把倉位縮到
+        risk_pct * 0.6，影響正常交易。整段邏輯應在 Forward Test 滿一個月前停用。
+  修正：將 _bt_stats_cache 放大/縮小段整體註解，改用固定基礎風險比。
+        等 Forward Test 累積 ≥ 30 筆且連續一個月後再評估重啟。
 
-【FEAT-NEW-2】S 級量比「一票否決」強化
-  - 原 FEAT-3 僅在判定 S 級後降級；現改為：量比未達門檻時，
-    在進入共振計分前就直接攔截（防止 sc 4/5 卻量能不足的假 S 級）
-  - VR_Adj 模式：vr < 1.2 在 sig_surge 入口即過濾（原：vr < 1.5 只降級）
-  - yfinance 模式：vr < 1.0 在入口過濾（原：vr < 1.2 只降級）
-  - 注意：該門檻刻意低於 vol_thresh，只攔截「極端無量」，不縮減正常訊號
+[FIX-C] 版本號更新（v9.8.5 → v9.8.6）
 
-【FEAT-NEW-3】SMC「無結構」處理
-  - sig_surge 中，若 smc == "無結構" 且 sc == 5（滿分），強制降為 A 級
-  - 不直接過濾（避免訊號太少），但加上 ⚠️ 標記
-  - sig_crash 中 smc == "無結構" 維持原邏輯（crash 以價量為主）
-
-【BUG繼承】完整保留 v9.8.1 & v9.8.2 全部修正：
-  BUG-1: bmx funding float() 空字串崩潰
-  BUG-2: 空頭路徑補 log_forward_test
-  BUG-3: 有結果即時 save_cache
-  BUG-5: format_digest crash_syms 標記
-  BUG-6: import re 移至頂部
-  BUG-8: get_tw_stable _clean typo
-  FEAT-1: validate_breakout_v3 三重校驗
-  FEAT-2: sig_surge 硬性量能底線 < 1000 股
-  FEAT-3: S 級 VR 降級（保留，作為二道防線）
-  FEAT-4: CRYPTO_LONG / CRYPTO_SHORT 區分
-  crash_seal 翻轉邏輯（🔄）
+【繼承】完整保留 v9.8.1 ~ v9.8.5 全部修正
 """
 
 import re
@@ -51,6 +35,15 @@ import json
 from datetime import datetime, timedelta
 import pytz
 from dataclasses import dataclass, asdict
+
+# scipy 為可選依賴，sig_btc_trend 會降級到 numpy polyfit
+try:
+    from scipy.stats import linregress as _scipy_linregress
+    def _linregress(x, y):
+        return _scipy_linregress(x, y).slope
+except ImportError:
+    def _linregress(x, y):
+        return float(np.polyfit(x, y, 1)[0])
 
 # ── Token ──────────────────────────────────────────────────────────────────────
 
@@ -69,7 +62,7 @@ TICKERS = {
              "AAPL","META","MSFT","GOOGL","PLTR","QQQ"],
     "🛡️": ["PANW","FTNT","CRWD"],
     "⚛️": ["SMR","OKLO","NNE"],
-    "🚀": ["CRCL","COIN","MSTR","BMNR","MARA","CLSK","HOOD","SOFI",
+    "🚀": ["CRCL","COIN","MSTR","MARA","CLSK","HOOD","SOFI",
             "APLD","IONQ","RGTI","NVTS","AAOI","RCAT","ONDS",
             "AXTI","AEHR","ACMR","KTOS","SERV","CRDO","ALAB","INTC","ASX"],
     "🇹🇼": ["2330.TW","00631L.TW","3324.TW","3017.TW","2308.TW","3711.TW"],
@@ -90,6 +83,12 @@ PORTFOLIO_HINTS = {
     "AXTI": "⚠️ 薄流動性，信號確認後小倉，止損嚴格",
     "ONDS": "⚠️ 薄流動性，只做盤前跳空信號",
 }
+
+# ── 薄流動性妖股（跳過 get_consistent，走專屬 sig_gap_rocket）───────────────
+THIN_LIQ_SYMS = {"AXTI", "ONDS"}
+
+# ── 核心持倉左側抄底監控名單（週線 FVG + RSI 底背離）──────────────────────
+CORE_VALUE_SYMS = ["NVDA", "AVGO", "TSLA", "AMD", "ANET", "MSFT", "GOOGL", "META", "AMZN"]
 
 # ── 風控設定 ──────────────────────────────────────────────────────────────────
 
@@ -193,26 +192,64 @@ def log_forward_test(sym, strategy, entry, stop, target, shares=0):
     })
     save_fwd(data)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [FIX-A] settle_forward_tests — 全路徑結算修正版
+#
+# 原版問題：只用 df["Close"].iloc[-1]（最後一根收盤）判斷盈虧，
+#           完全忽略路徑中途已觸及停損或目標的情況，導致結算嚴重失真。
+#
+# 修正邏輯：
+#   1. 抓取進場後的 5m K 線（period="5d" 涵蓋近期路徑）
+#   2. 取 period_low（最低點）和 period_high（最高點）
+#   3. 停損優先：先判 period_low <= stop → STOPPED @ stop price
+#   4. 再判 period_high >= target → TARGET_HIT @ target price
+#   5. 兩者都未觸及 → 維持 OPEN
+#
+# 限制說明：
+#   - 同根 K 棒同時穿越停損與目標時，停損優先（保守原則）
+#   - 若需要更精確的逐 K 棒路徑判斷（追蹤哪個先發生），
+#     需逐行掃描，代碼複雜度大幅上升，目前保留此簡化版。
+# ══════════════════════════════════════════════════════════════════════════════
+
 def settle_forward_tests():
+    """修復版：全路徑結算，不再只看最後一秒價格"""
     data = load_fwd(); changed = False
     for row in data:
         if row.get("status") != "OPEN": continue
         sym = row["sym"]
         try:
-            df    = _clean(yf.download(sym, interval="5m", period="5d", progress=False, auto_adjust=True))
+            # 抓取進場到現在的 5 分鐘 K 線路徑
+            df = _clean(yf.download(sym, interval="5m", period="5d", progress=False, auto_adjust=True))
             if df.empty: continue
-            px    = float(df["Close"].iloc[-1])
-            entry = float(row["entry"]); stop = float(row["stop"]); target = float(row["target"])
-            risk  = entry - stop
+
+            entry  = float(row["entry"])
+            stop   = float(row["stop"])
+            target = float(row["target"])
+            risk   = entry - stop
             if risk <= 0: continue
-            if px <= stop:
-                row.update({"status": "STOPPED",    "exit": round(px,4), "r_multiple": -1.0})
+
+            # 取得這段期間的最高與最低點（全路徑）
+            period_high = float(df["High"].max())
+            period_low  = float(df["Low"].min())
+
+            # 判定：停損優先（若同根 K 棒同時穿越，以保守原則計損）
+            if period_low <= stop:
+                row.update({
+                    "status":     "STOPPED",
+                    "exit":       round(stop, 4),
+                    "r_multiple": -1.0,
+                })
                 changed = True
-            elif px >= target:
-                row.update({"status": "TARGET_HIT", "exit": round(px,4), "r_multiple": round((target-entry)/risk, 2)})
+            elif period_high >= target:
+                row.update({
+                    "status":     "TARGET_HIT",
+                    "exit":       round(target, 4),
+                    "r_multiple": round((target - entry) / risk, 2),
+                })
                 changed = True
         except: pass
     if changed: save_fwd(data)
+
 
 def build_strategy_stats(fwd_data=None):
     data    = fwd_data if fwd_data is not None else load_fwd()
@@ -252,6 +289,25 @@ def analyze_portfolio(fwd_data=None):
         "recent_r":   recent_r,
     }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [FIX-B] calc_position — 關閉 _bt_stats_cache 放大/縮小段
+#
+# 原版問題：
+#   run_weekend_backtest 用日線粗算的回測數據：
+#     SURGE  勝率 23% / 期望 -0.30R（樣本 111）
+#     WASHOUT 勝率 26% / 期望 -0.20R（樣本 667）
+#   這些數據是負期望，理論上不應觸發放大（需 wr>=0.55），
+#   但負期望縮小段（exp<0.0）卻在實際運行，把正常倉位縮到 60%。
+#
+# 修正：整個 _bt_stats_cache 判斷段落暫時停用。
+#   等 Forward Test 累積 ≥ 30 筆、連續一個月數據後再評估是否重啟。
+#   目前信任 RISK_BUDGET 固定比例（0.5%），不依賴日線回測假勝率。
+#
+# 重啟條件（備忘）：
+#   Forward Test 滿 30 筆 AND 連續 4 週 AND 期望 >= 0.20R
+#   → 取消下方 bt_stats_cache 段落的註解
+# ══════════════════════════════════════════════════════════════════════════════
+
 def calc_position(entry, stop, strategy="DEFAULT", stats=None, pf=None):
     risk_per_share = abs(entry - stop)
     if risk_per_share <= 0: return 0
@@ -259,25 +315,37 @@ def calc_position(entry, stop, strategy="DEFAULT", stats=None, pf=None):
         if pf["open_count"] >= MAX_OPEN_POSITIONS: return 0
         max_total_risk_dollar = ACCOUNT_BAL * MAX_TOTAL_RISK
         if pf["total_risk"] >= max_total_risk_dollar: return 0
+
     risk_pct = RISK_BUDGET.get(strategy, RISK_BUDGET["DEFAULT"]) * STRATEGY_WEIGHT.get(strategy, 1.0)
+
+    # Forward Test 統計調整（需 sample_size >= 20 才啟用）
     if stats and stats.sample_size >= 20:
         if stats.expectancy_r >= 0.4 and stats.winrate >= 0.55:
             risk_pct = min(risk_pct * 1.25, 0.01)
         elif stats.expectancy_r < 0.0:
             risk_pct = max(risk_pct * 0.5, 0.002)
-    elif _bt_stats_cache.get(strategy, {}).get("n", 0) >= 30:
-        bt = _bt_stats_cache[strategy]
-        if bt["wr"] >= 0.55 and bt["exp"] >= 0.3:
-            risk_pct = min(risk_pct * 1.15, 0.008)
-        elif bt["exp"] < 0.0:
-            risk_pct = max(risk_pct * 0.6, 0.002)
+
+    # [FIX-B] 日線回測放大/縮小段 — 暫停使用
+    # 原因：日線回測勝率不可靠（SURGE 23%/-0.30R，WASHOUT 26%/-0.20R）
+    # 等 Forward Test 滿一個月 + 30 筆後再重啟評估
+    #
+    # elif _bt_stats_cache.get(strategy, {}).get("n", 0) >= 30:
+    #     bt = _bt_stats_cache[strategy]
+    #     if bt["wr"] >= 0.55 and bt["exp"] >= 0.3:
+    #         risk_pct = min(risk_pct * 1.15, 0.008)
+    #     elif bt["exp"] < 0.0:
+    #         risk_pct = max(risk_pct * 0.6, 0.002)
+
+    # 近期連虧保護：最近 5 筆合計 <= -3R，半倉操作
     if pf is not None and pf.get("recent_r", 0) <= -3:
         risk_pct *= 0.5
+
     if pf is not None:
         remaining_risk = ACCOUNT_BAL * MAX_TOTAL_RISK - pf["total_risk"]
         actual_budget  = min(ACCOUNT_BAL * risk_pct, max(remaining_risk, 0))
     else:
         actual_budget  = ACCOUNT_BAL * risk_pct
+
     shares        = int(actual_budget / risk_per_share)
     max_affordable = int(ACCOUNT_BAL / entry) if entry > 0 else 0
     return min(shares, max_affordable)
@@ -337,7 +405,6 @@ def is_toxic_premarket_time():
     """
     ny = _ny()
     m  = ny.hour * 60 + ny.minute
-    # 美東 04:00 = 分鐘數 240，04:15 = 255
     return 240 <= m < 255
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -537,7 +604,7 @@ def get_consistent(sym):
     return df5, df15, "yfinance"
 
 def get_tw_stable(sym):
-    # [BUG-8 FIX] 修正原碼 `*clean` typo
+    # [BUG-8 FIX] 修正原碼 `*clean` typo（v9.8.4 已修正，確認保留）
     for iv, pd_ in [("5m","2d"),("15m","5d"),("1h","5d")]:
         df = _clean(yf.download(sym, interval=iv, period=pd_, progress=False, auto_adjust=True))
         if not df.empty and len(df) >= 5: return df
@@ -631,6 +698,202 @@ def validate_breakout_v3(df, tag):
 
     return True, ""
 
+# ══════════════════════════════════════════════════════════════════════════════
+# detect_rsi_divergence — sig_core_value_bottom 輔助函式
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_rsi_divergence(df_d, lookback=60):
+    """
+    日線 RSI 底背離（多頭背離）：
+    價格創新低，RSI 未創新低，且 RSI 在超賣區（< 45）
+    """
+    if len(df_d) < lookback or "RSI" not in df_d.columns:
+        return False
+    df     = df_d.tail(lookback)
+    closes = df["Close"].values
+    rsies  = df["RSI"].values
+    price_lows = []
+    for i in range(5, len(closes) - 2):
+        if closes[i] < closes[i-1] and closes[i] < closes[i+1]:
+            price_lows.append(i)
+    if len(price_lows) < 2:
+        return False
+    i1, i2 = price_lows[-2], price_lows[-1]
+    return (closes[i2] < closes[i1]) and (rsies[i2] > rsies[i1]) and (rsies[i2] < 45)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sig_gap_rocket — 薄流動性妖股盤前跳空專用
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sig_gap_rocket(sym, tag, cache, earn_warn=""):
+    ck = f"gap_rocket_{sym}_{_ny().strftime('%Y%m%d')}"
+    if not cooled(cache, ck, 360): return None
+
+    status = us_status()
+    if status not in ("PRE", "OPEN"): return None
+    if status == "OPEN":
+        ny = _ny()
+        if (ny.hour - 9) * 60 + (ny.minute - 30) > 30: return None
+
+    try:
+        df1d = get_yf(sym, "1d", "20d")
+        if len(df1d) < 6: return None
+        yest_close = float(df1d["Close"].iloc[-2])
+        avg_vol    = float(df1d["Volume"].tail(10).mean())
+
+        pre_df = get_alpaca(sym, "1Min", 120)
+        if pre_df.empty:
+            pre_df = get_yf(sym, "1m", "2d")
+        if pre_df.empty: return None
+
+        ny_today = _ny().date()
+        try:   idx = pre_df.index.tz_convert("America/New_York")
+        except: idx = pre_df.index
+        today_bars = pre_df[[t.date() == ny_today for t in idx]]
+        if len(today_bars) < 3: return None
+
+        curr_price = float(today_bars["Close"].iloc[-1])
+        total_vol  = float(today_bars["Volume"].sum())
+        chg        = (curr_price - yest_close) / yest_close * 100
+
+        min_abs_vol = max(avg_vol * 0.05, 5000)
+        G1 = chg > 8.0
+        G2 = total_vol > min_abs_vol
+        expected_vol = (avg_vol / 390) * max(len(today_bars), 1)
+        vr = total_vol / (expected_vol + 1)
+        G3 = vr > 0.8
+        df1d_rsi = add_rsi(df1d)
+        yest_rsi = float(df1d_rsi["RSI"].iloc[-2]) if not pd.isna(df1d_rsi["RSI"].iloc[-2]) else 50
+        G4 = yest_rsi < 80
+
+        if not (G1 and G2): return None
+        sc = sum([G1, G2, G3, G4])
+        g  = "🏆 S級" if sc == 4 else "🥇 A級"
+        mark(cache, ck)
+
+        warn = " ⚠️ 昨RSI偏高" if yest_rsi >= 70 else ""
+        hint = PORTFOLIO_HINTS.get(sym, "")
+        status_label = "盤前跳空" if status == "PRE" else "開盤延續"
+        advice = (
+            f"薄流動性妖股跳空+{chg:.1f}%，量{total_vol/1000:.0f}K，"
+            f"極小倉試進，止損昨收{yest_close:.2f}{warn}"
+        )
+        return {"score": sc + 7, "type": "🌅", "sym": sym, "msg": (
+            f"{tag} 🌅 *[妖股跳空]* `{sym}` {g}{earn_warn}\n"
+            f"💰 現價:`{curr_price:.2f}` · 📈:`{chg:+.1f}%` vs 昨收`{yest_close:.2f}`\n"
+            f"📊 量:`{total_vol/1000:.0f}K` · 量比:`{vr:.1f}x` · 昨RSI:`{yest_rsi:.0f}`\n"
+            f"燈號:{L(G1)}跳空>8% {L(G2)}有量 {L(G3)}量比 {L(G4)}RSI可控\n"
+            + (f"📌 {hint}\n" if hint else "")
+            + f"🎫 *[{status_label}]*: {advice}\n"
+              f"⏰ {tw_time()} TWN"
+        )}
+    except Exception as e:
+        print(f"  gap_rocket {sym}: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sig_core_value_bottom — 核心持倉左側抄底（週線 FVG + 日線 RSI 底背離）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sig_core_value_bottom(sym, cache):
+    ck = f"core_bottom_{sym}"
+    if not cooled(cache, ck, 1440): return None
+
+    try:
+        df_w = get_yf(sym, "1wk", "2y")
+        fvg  = None
+        if len(df_w) >= 5:
+            for i in range(2, min(12, len(df_w) - 2)):
+                h_left  = float(df_w["High"].iloc[-i-2])
+                l_right = float(df_w["Low"].iloc[-i])
+                if h_left < l_right:
+                    fvg = {"top": l_right, "bot": h_left}
+                    break
+
+        df_d       = add_rsi(get_yf(sym, "1d", "6mo"))
+        if df_d.empty: return None
+        curr_price = float(df_d["Close"].iloc[-1])
+        is_div     = detect_rsi_divergence(df_d)
+
+        in_fvg = bool(fvg and (fvg["bot"] * 0.98 <= curr_price <= fvg["top"] * 1.02))
+
+        if not (is_div or in_fvg): return None
+
+        sc = sum([bool(is_div), in_fvg])
+        g  = "🏆 S級" if sc >= 2 else "🥇 A級"
+        mark(cache, ck)
+
+        hint    = PORTFOLIO_HINTS.get(sym, "")
+        fvg_txt = (
+            f"週線FVG:`{fvg['bot']:.2f}~{fvg['top']:.2f}` "
+            f"({'✅回踩中' if in_fvg else '⏳接近中'})"
+            if fvg else "週線FVG:未找到"
+        )
+        ind_txt = "RSI底背離✅" if is_div else "RSI待確認⏳"
+
+        lines = [
+            f"🇺🇸 🛡️ *[核心價值抄底]* `{sym}` {g}",
+            f"💰 現價:`{curr_price:.2f}`",
+            f"🏰 {fvg_txt}",
+            f"📈 指標:`{ind_txt}`",
+            f"燈號:{L(in_fvg)}週線FVG {L(is_div)}RSI底背離",
+        ]
+        if hint:
+            lines.append(f"📌 {hint}")
+        lines += [
+            f"📝 *策略*: 核心資產進入長線支撐，適合分批金字塔建倉。",
+            f"⏰ {tw_time()} TWN",
+        ]
+        return {"score": 25, "type": "🛡️", "sym": sym, "msg": "\n".join(lines)}
+    except Exception as e:
+        print(f"  core_bottom {sym}: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sig_btc_trend — BTC 右側趨勢確認（半木夏 Pro + 線性回歸斜率）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sig_btc_trend(cache, pf=None):
+    ck = f"btc_trend_{_ny().strftime('%Y%m%d_%H')}"
+    if not cooled(cache, ck, 60): return None
+
+    try:
+        df15 = get_yf("BTC-USD", "15m", "7d")
+        if df15.empty or len(df15) < 60: return None
+
+        import copy
+        cache_copy = copy.copy(cache)
+        bmx_results = sig_banmuxa("BTC-USD", "BTC/USDT", df15, cache_copy, pf)
+        if not bmx_results: return None
+
+        bmx_sig = max(bmx_results, key=lambda x: x["score"])
+
+        closes = df15["Close"].tail(30).values
+        if len(closes) < 30: return None
+        slope = _linregress(list(range(30)), closes)
+
+        is_bull = "多頭" in bmx_sig["msg"]
+        is_bear = "空頭" in bmx_sig["msg"]
+        if not ((is_bull and slope > 0) or (is_bear and slope < 0)):
+            return None
+
+        direction = "向上📈" if slope > 0 else "向下📉"
+        mark(cache, ck)
+
+        return {
+            "score": bmx_sig["score"] + 3,
+            "type":  bmx_sig["type"],
+            "sym":   bmx_sig["sym"],
+            "msg":   bmx_sig["msg"] + f"\n📐 *動量確認*: 15m斜率{direction} (`{slope:.4f}`)",
+        }
+    except Exception as e:
+        print(f"  btc_trend: {e}")
+        return None
+
+
 def passes_trend(sym, tag, df1d=None):
     if tag in VOLATILE_TAGS: return True
     CORE_BYPASS = {
@@ -661,8 +924,6 @@ def passes_trend(sym, tag, df1d=None):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # sig_crash
-# [BUG-FIX-1] 移除第一個重複且不完整的 sig_crash 定義
-# 保留此唯一完整版本（含 last_type_{sym}、crash_seal 寫入）
 # ══════════════════════════════════════════════════════════════════════════════
 
 def sig_crash(sym, tag, df5, df15, source, cache, earn_warn=""):
@@ -703,7 +964,6 @@ def sig_crash(sym, tag, df5, df15, source, cache, earn_warn=""):
     mark(cache, ck)
     _crash_warned.add(sym)
     mark(cache, f"crash_seal_{sym}")
-    # 記錄 crash 嚴重程度（供翻轉判斷參考）與最後信號類型
     cache[f"crash_sc_{sym}"]  = sc
     cache[f"last_type_{sym}"] = "⛈️"
     save_cache(cache)
@@ -733,7 +993,6 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
 
     if not regime_on and not is_rocket: return None
 
-    # [FEAT-2] 硬性量能底線：當根成交量 < 1000 股直接過濾
     if float(c["Volume"]) < 1000:
         return None
 
@@ -746,8 +1005,6 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
     if "VR_Adj" in df.columns:
         vr         = float(df["VR_Adj"].iloc[-1])
         vol_thresh = 0.8 if is_rocket else 1.5
-        # [FEAT-NEW-2] S 級量比一票否決（入口攔截，僅針對極端低量）
-        # 門檻刻意低於 vol_thresh，只攔截幾乎無量的極端情況
         vr_hard_floor = 0.5 if is_rocket else 1.0
     else:
         vr         = c["Volume"] / (c["VMA"] + 1)
@@ -755,7 +1012,6 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
         if source == "yfinance": vol_thresh = max(vol_thresh * 0.85, 1.1)
         vr_hard_floor = 0.6 if is_rocket else 0.8
 
-    # [FEAT-NEW-2] 硬性地板：低於此值連 A 級都不給
     if vr < vr_hard_floor:
         print(f"  {sym}: VR {vr:.2f} < 硬性地板 {vr_hard_floor:.2f}，直接過濾")
         return None
@@ -804,7 +1060,6 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
     if not (c1 and c2 and c3): return None
     sc = sum([c1,c2,c3,c4,c5])
 
-    # ── crash_seal 翻轉判斷 ────────────────────────────────────────────────
     seal_key      = f"crash_seal_{sym}"
     in_seal       = not cooled(cache, seal_key, 60)
     is_reversal   = False
@@ -815,32 +1070,26 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
         if not valid_pre or sc < 4:
             print(f"  {sym}: crash_seal 封印 (物理:{reason_pre or 'ok'}, sc:{sc}/5)，封印維持")
             return None
-        # 物理通過 + 條件充足 → 翻轉
         is_reversal     = True
         sc              = min(sc + 1, 5)
         reversal_prefix = "🔄 *[訊號翻轉]* 收復早前賣壓，結構由空轉多！\n"
         print(f"  {sym}: crash_seal 封印但物理通過 sc={sc}，發出翻轉信號")
-    # ── 翻轉判斷結束 ───────────────────────────────────────────────────────
 
     g = grade(sc, 5)
     if not g: return None
 
-    # [FEAT-3] S 級量能門檻（二道防線，仍保留）
     if g == "🏆 S級":
         if "VR_Adj" in df.columns:
             if vr < 1.5: g = "🥇 A級"
         else:
             if vr < 1.2: g = "🥇 A級"
 
-    # [FEAT-NEW-3] SMC 無結構：S 級強制降 A 級並加警告標記
-    # 不過濾（避免訊號太少），但降級 + 提醒
     smc_warn = ""
     if smc == "無結構" and g == "🏆 S級":
         g        = "🥇 A級"
         smc_warn = " ⚠️SMC無結構"
         print(f"  {sym}: SMC無結構，S→A 級")
 
-    # 物理校驗（翻轉路徑已在上方做過，此處只走正常路徑）
     if not is_reversal:
         valid, reason = validate_breakout_v3(df, tag)
         if not valid:
@@ -890,12 +1139,6 @@ def sig_surge(sym, tag, df5, df15, source, cache, regime_on=True,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def sig_pregap(sym, tag, cache, earn_warn=""):
-    """
-    盤前跳空訊號。
-    [FEAT-NEW-1] 豁免 is_toxic_premarket_time()：
-      - 16:00~16:14（美東 04:00~04:14）此函式仍可執行，
-        但在結果中加上「建議 04:15 後確認」提示。
-    """
     ck = f"pregap_{sym}_{_ny().strftime('%Y%m%d')}"
     if not cooled(cache, ck, 720): return None
     try:
@@ -929,7 +1172,6 @@ def sig_pregap(sym, tag, cache, earn_warn=""):
         vr   = pre_vol / (avg_vol + 1)
         warn = " ⚠️ 昨RSI偏高，注意高開低走" if yest_rsi >= 70 else ""
 
-        # [FEAT-NEW-1] 低流動性視窗提醒（不過濾，但提示等待）
         toxic_note = ""
         if is_toxic_premarket_time():
             toxic_note = "\n⏳ *[建議等待]* 現處 04:00~04:15 低流動性視窗，04:15 後確認仍成立再行動"
@@ -1189,16 +1431,38 @@ def scan_vcp(ticker_list, cache, stats=None, pf=None):
 # 半木夏 Pro — sig_banmuxa
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _bmx_get_funding(disp_sym):
+def _to_futures_sym(display_str):
     """
-    [BUG-6 FIX] import re 已移至頂部，不重複。
+    [FIX-1] 將任意顯示格式轉換為 Binance 永續合約 symbol。
+    防止「已是完整交易對時重複補 USDT」的致命錯誤。
     """
-    s       = str(disp_sym).strip().upper()
+    s = str(display_str).strip().upper()
     compact = re.sub(r"[/:\-\s]", "", s)
+
+    if len(compact) > 4:
+        if compact.endswith("USDT") or compact.endswith("BUSD"):
+            return compact
+        if compact == "ETHBTC" or (compact.endswith("BTC") and len(compact) >= 6):
+            return compact
+
+    if compact == "ETHBTC":
+        return "ETHBTC"
+
+    if any(c in display_str for c in "/:-"):
+        base = re.split(r"[/:\-]", display_str)[0].strip().upper()
+        return f"{base}USDT"
+
+    return f"{compact}USDT"
+
+
+def _bmx_get_funding(disp_sym):
+    """[FIX-1] 使用 _to_futures_sym() 替代舊的內聯映射邏輯。"""
+    s         = str(disp_sym).strip().upper()
+    compact   = re.sub(r"[/:\-\s]", "", s)
     is_ethbtc = (compact == "ETHBTC")
-    syms = ["ETHUSDT", "BTCUSDT"] if is_ethbtc else [
-        compact if compact.endswith("USDT") else compact + "USDT"
-    ]
+
+    syms = ["ETHUSDT", "BTCUSDT"] if is_ethbtc else [_to_futures_sym(disp_sym)]
+
     vals = []
     for sym in syms:
         try:
@@ -1258,13 +1522,10 @@ def _bmx_trend_break(df, price, w=14, mode="bull"):
 
 def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
     """
-    半木夏 Pro — 完整繼承 v9.8.2 全部修正。
-    [BUG-1] funding cache 空字串守門
-    [BUG-2] 空頭補 log_forward_test
-    [BUG-3] 有結果即時 save_cache
-    [FEAT-4] CRYPTO_LONG / CRYPTO_SHORT 區分
+    半木夏 Pro — 完整繼承 v9.8.2~v9.8.5 全部修正。
+    [FIX-5] ck 含 disp 防未來碰撞
     """
-    ck = f"bmx_{disp}"
+    ck = f"bmx_{yf_sym}_{disp}"
     if not cooled(cache, ck, 120) or len(df15) < 120: return None
 
     df = add_atr(add_macd(df15.copy()))
@@ -1286,22 +1547,35 @@ def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
     results   = []
     is_ethbtc = str(disp).upper().replace("/","").replace("-","") == "ETHBTC"
 
-    # ── Funding 取值（BUG-1）────────────────────────────────────────────────
-    f_cache_key    = f"bmx_funding_{disp}"
-    f_cache_ts_key = f"bmx_funding_ts_{disp}"
+    # ── Funding 取值（[FIX-2] 分層隔離，[FIX-3] 失敗短暫 cache）────────────
+    funding_store  = cache.setdefault("_funding", {})
+    f_cache_key    = f"val_{disp}"
+    f_cache_ts_key = f"ts_{disp}"
     now_utc        = datetime.utcnow().timestamp()
     f_val          = None
-    if f_cache_ts_key in cache:
+
+    if f_cache_ts_key in funding_store:
         try:
-            if now_utc - float(cache[f_cache_ts_key]) < 3600:
-                raw = cache.get(f_cache_key)
-                f_val = float(raw) if raw else None
+            cache_age = now_utc - float(funding_store[f_cache_ts_key])
+            raw       = funding_store.get(f_cache_key)
+            if raw == "__FAIL__":
+                if cache_age < 600:
+                    f_val = None
+            elif raw and cache_age < 3600:
+                f_val = float(raw)
         except Exception:
             pass
-    if f_val is None:
-        f_val = _bmx_get_funding(disp)
-        cache[f_cache_key]    = str(f_val) if f_val is not None else ""
-        cache[f_cache_ts_key] = str(now_utc)
+
+    if f_val is None and funding_store.get(f_cache_key) != "__FAIL__":
+        fetched = _bmx_get_funding(disp)
+        if fetched is not None:
+            funding_store[f_cache_key]    = str(fetched)
+            funding_store[f_cache_ts_key] = str(now_utc)
+            f_val = fetched
+        else:
+            funding_store[f_cache_key]    = "__FAIL__"
+            funding_store[f_cache_ts_key] = str(now_utc)
+            f_val = None
 
     def funding_grade(fv, direction):
         if fv is None: return "中性", 0
@@ -1346,7 +1620,7 @@ def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
                         f"₿ 🚀 *[半木夏 Pro 多頭]* `{disp}` {grade_lbl}\n"
                         f"💰 現價:`{price:.4f}`\n"
                         f"📊 MACD三谷跨{t3-t1}根 · 低點遞升 · 壓力線突破\n"
-                        f"📐 趨勢斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
+                        f"📐 每bar斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
                         f"🎯 止損:`{stop:.4f}` 目標:`{target:.4f}` (1:2)\n"
                         + (f"🛡️ 建議:`{shares}單位`\n" if shares > 0 else "")
                         + f"⏰ {tw_time()} TWN")})
@@ -1377,7 +1651,6 @@ def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
                     risk   = stop - price
                     target = price - risk * 2
                     shares = calc_position(price, price + risk, "CRYPTO", None, pf)
-                    # [BUG-2 FIX] 空頭補 log_forward_test + [FEAT-4] CRYPTO_SHORT
                     if shares > 0:
                         log_forward_test(disp, "CRYPTO_SHORT", price, stop, target, shares)
                     mark(cache, ck)
@@ -1389,11 +1662,10 @@ def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
                         f"₿ 🔻 *[半木夏 Pro 空頭]* `{disp}` {grade_lbl}\n"
                         f"💰 現價:`{price:.4f}`\n"
                         f"📊 MACD三峰跨{p3-p1}根 · 高點遞降 · 支撐線跌破\n"
-                        f"📐 趨勢斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
+                        f"📐 每bar斜率:`{p_slope:.5f}` · 情緒:`{f_text}`({f_str})\n"
                         f"🎯 止損:`{stop:.4f}` 目標:`{target:.4f}` (1:2)\n"
                         + f"⏰ {tw_time()} TWN")})
 
-    # [BUG-3 FIX] 有結果才即時落盤
     if results:
         save_cache(cache)
 
@@ -1405,9 +1677,6 @@ def sig_banmuxa(yf_sym, disp, df15, cache, pf=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def format_digest(sigs, label, regime_on=True, strategy_stats=None, crash_syms=None):
-    """
-    [BUG-5 FIX] crash_syms 標記彙整中的 SURGE/WASHOUT 降級顯示。
-    """
     if crash_syms is None:
         crash_syms = set()
 
@@ -1418,6 +1687,7 @@ def format_digest(sigs, label, regime_on=True, strategy_stats=None, crash_syms=N
         "🏦SMC":       sorted([s for s in sigs if s["type"]=="🏦"],                      key=lambda x:-x["score"]),
         "📈波段":      sorted([s for s in sigs if s["type"]=="📈"],                      key=lambda x:-x["score"]),
         "🎯VCP":       sorted([s for s in sigs if s["type"]=="🎯"],                      key=lambda x:-x["score"]),
+        "🛡️核心抄底":  sorted([s for s in sigs if s["type"]=="🛡️"],                     key=lambda x:-x["score"]),
         "₿加密":       sorted([s for s in sigs if s["type"]=="₿"],                      key=lambda x:-x["score"]),
     }
     regime_txt = "🟢多頭(QQQ>10MA)" if regime_on else "🔴空頭(一般股封印)"
@@ -1478,13 +1748,15 @@ def send_weekly_report(stats, bt_cache):
     tw_now = _tw()
     lines  = [f"📊 *CC Scanner 週報 {tw_now.strftime('%m/%d')}*", ""]
     if stats:
+        lines.append("*Forward Test 實際統計*")
         for k, s in stats.items():
             if s.sample_size >= 3:
                 lines.append(f"• `{k}` {s.sample_size}筆 勝率:{s.winrate:.0%} 期望:{s.expectancy_r:.2f}R")
+    # [FIX-B] 日線回測段保留顯示但加上警語，提醒不應依賴此數據調倉
     if bt_cache:
-        lines += ["", "*歷史回測（近2年）*"]
+        lines += ["", "*歷史回測（近2年日線，僅供參考，倉位調整已停用）*"]
         for s, d in bt_cache.items():
-            lines.append(f"• `{s}` 勝率:{d['wr']:.0%} 期望:{d['exp']:.2f}R 樣本:{d['n']}")
+            lines.append(f"• `{s}` 勝率:{d['wr']:.0%} 期望:{d['exp']:.2f}R 樣本:{d['n']} ⚠️僅參考")
     if len(lines) > 2:
         send_tg("\n".join(lines))
     print("週報已發送")
@@ -1573,7 +1845,7 @@ def main():
         print(f"跨日清除 {len(stale_keys)} 個 crash_seal")
 
     print(f"\n{'='*55}")
-    print(f"CC Scanner v9.8.3 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
+    print(f"CC Scanner v9.8.6 · {tw_now.strftime('%Y-%m-%d %H:%M')} TWN")
     print(f"美股:{status} | 模式:{mode}")
     print(f"Alpaca:{'✓' if ALPACA_KEY else '✗'} · FMP:{'✓' if FMP_KEY else '✗'} · 帳戶:{ACCOUNT_BAL:,}")
     print(f"風控: 最大持倉={MAX_OPEN_POSITIONS} · 最大總風險={MAX_TOTAL_RISK*100:.0f}%")
@@ -1595,8 +1867,6 @@ def main():
 
     if mode == "SILENT": print("靜默模式"); return
 
-    # [FEAT-NEW-1] 低流動性時間窗口：僅記錄，不中斷執行
-    # 讓 sig_pregap 仍能收集資料，但日內訊號在發送層會被抑制
     toxic_window = is_toxic_premarket_time()
     if toxic_window:
         print(f"⚠️ 低流動性時窗 04:00~04:15 (美東)，日內訊號發送抑制中")
@@ -1611,7 +1881,7 @@ def main():
 
     _bt_stats_cache = cache.get("bt_stats", {})
     if _bt_stats_cache:
-        print(f"已載入回測快取: {list(_bt_stats_cache.keys())}")
+        print(f"已載入回測快取: {list(_bt_stats_cache.keys())} （倉位調整已停用，僅供參考）")
 
     regime_on  = get_market_regime(cache)
     regime_txt = "🟢多頭" if regime_on else "🔴空頭(一般股封印)"
@@ -1624,6 +1894,15 @@ def main():
         for tag in ["🇺🇸","🛡️","⚛️","🚀"]:
             for sym in TICKERS.get(tag, []):
                 try:
+                    if sym in THIN_LIQ_SYMS:
+                        earn_warn = get_earn_warn(sym, cache)
+                        r = sig_gap_rocket(sym, tag, cache, earn_warn)
+                        if r: all_sigs.append(r)
+                        if status == "PRE":
+                            r = sig_pregap(sym, tag, cache, earn_warn)
+                            if r: all_sigs.append(r)
+                        continue
+
                     df1d = get_yf(sym, "1d", "200d")
                     if not passes_trend(sym, tag, df1d): continue
                     earn_warn = get_earn_warn(sym, cache)
@@ -1664,11 +1943,22 @@ def main():
                 if _s not in sym_tag_map:
                     sym_tag_map[_s] = _t
         for sym, tag in sym_tag_map.items():
+            if sym in THIN_LIQ_SYMS: continue
             try:
                 earn_warn = get_earn_warn(sym, cache)
                 r = sig_pregap(sym, tag, cache, earn_warn)
                 if r: all_sigs.append(r)
             except Exception as e: print(f"  盤前{sym}: {e}")
+
+    # ── 薄流動性妖股 OPEN 補跑 ────────────────────────────────────────────────
+    if status == "OPEN":
+        for sym in THIN_LIQ_SYMS:
+            tag = next((t for t in ["🚀","⚛️","🇺🇸"] if sym in TICKERS.get(t, [])), "🚀")
+            try:
+                earn_warn = get_earn_warn(sym, cache)
+                r = sig_gap_rocket(sym, tag, cache, earn_warn)
+                if r: all_sigs.append(r)
+            except Exception as e: print(f"  thin_liq OPEN {sym}: {e}")
 
     # ── 美股波段 + VCP ─────────────────────────────────────────────────────────
     if is_us_swing() or mode == "DIGEST_PRE":
@@ -1708,13 +1998,31 @@ def main():
             except Exception as e: print(f"  TW SWING{sym}: {e}")
 
     # ── 加密 ──────────────────────────────────────────────────────────────────
+    _btc_banmuxa_done = False
     for yf_sym, disp in TICKERS["₿"]:
         try:
             df15 = get_yf(yf_sym, "15m", "60d")
             if not df15.empty:
                 res = sig_banmuxa(yf_sym, disp, df15, cache, pf)
-                if res: all_sigs.extend(res)
+                if res:
+                    all_sigs.extend(res)
+                    if disp == "BTC/USDT":
+                        _btc_banmuxa_done = True
         except Exception as e: print(f"  ₿{disp}: {e}")
+
+    if not _btc_banmuxa_done:
+        try:
+            r = sig_btc_trend(cache, pf)
+            if r: all_sigs.append(r)
+        except Exception as e: print(f"  btc_trend: {e}")
+
+    # ── 核心價值抄底 ──────────────────────────────────────────────────────────
+    if status in ("PRE", "OPEN") or mode == "DIGEST_PRE":
+        for sym in CORE_VALUE_SYMS:
+            try:
+                r = sig_core_value_bottom(sym, cache)
+                if r: all_sigs.append(r)
+            except Exception as e: print(f"  core_bottom {sym}: {e}")
 
     save_cache(cache)
     all_sigs.sort(key=lambda x: x["score"], reverse=True)
@@ -1737,9 +2045,7 @@ def main():
         if st.sample_size >= 5:
             print(f"  {k}: {st.sample_size}筆 勝率{st.winrate:.0%} 期望{st.expectancy_r:.2f}R")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # 發送邏輯
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── 發送邏輯 ──────────────────────────────────────────────────────────────
     if mode in ("DIGEST_PRE", "DIGEST_TW_PRE", "DIGEST_TW_CLOSE"):
         digest_ck = f"digest_{mode}_{tw_now.strftime('%Y%m%d')}"
         if not cooled(cache, digest_ck, 55):
@@ -1758,7 +2064,6 @@ def main():
             print(f"已發送彙整報表（{label}），包含 {len(all_sigs)} 個信號。")
 
     elif mode == "OPEN_MODE":
-        # 暴跌：S 級 + (持倉 OR 妖股)
         crash_sent = 0
         for s in [x for x in all_sigs if x["type"] == "⛈️"]:
             if crash_sent >= 3: break
@@ -1769,8 +2074,6 @@ def main():
                 send_tg(s["msg"])
                 crash_sent += 1
 
-        # 暴漲：S 級 + IEX 即時 + 未在本次觸發 crash
-        # [FEAT-NEW-1] 低流動性視窗期間，SURGE 即時推送也抑制
         surge_sent = 0
         for s in [x for x in all_sigs if x["type"] == "🔮"]:
             if surge_sent >= 3: break
@@ -1785,7 +2088,6 @@ def main():
                 send_tg(s["msg"])
                 surge_sent += 1
 
-        # 每 30 分鐘彙整（含 crash_syms 標記）
         if is_digest_30_window() and all_sigs:
             send_tg(format_digest(
                 all_sigs,
